@@ -1,0 +1,2981 @@
+/* ---------------------------------------------------------------
+  sgenera_mavt -   Programa de Generacion de ficheros de configuracion de MAVT 
+                    Lineas.dat  Tarifas.new  SinContacto.new  Localiza.dat Param_sw.dat
+		              Parametros Fecha_referencia (yyyyMMDD) 
+			                      Fecha_entrada_vigor (DD/MM/YY) 
+					                Divisa (n)     
+             
+=================================================================
+            C O N T R O L   D E   V E R S I O N E S
+1.0           BMP 3.1.02
+2.0			  MVP 10.2.02
+
+  --------------------------------------------------------------- */
+#include <sys/stat.h>
+#include <stdio.h>
+#include <errno.h>
+#include <strings.h>
+#include <time.h>
+#include <stdlib.h>
+#include <oraca.h>
+#include <sqlca.h>
+#include <sqlcpr.h>
+
+#include "var_sgenera_mavt.h"
+
+
+EXEC ORACLE OPTION (ORACA=YES);
+
+unsigned long fecha_inicio_referencia;
+
+unsigned long  retorno, dia_juliano_fichero, anio_fichero,
+     tipo_registro, titulo, resultado, orden_titulo, num_tramo;
+
+
+char comando[200];
+char directorio_ficheros[100];
+char *directorio_log;
+FILE *fichero_clave;
+FILE *fichero_datos; 
+
+//(2004-06-28)Indica si no se quieren generar los ficheros de localizacion
+//Si es cero no se generan si es igual a 1 si
+int localiza=1;
+ 
+EXEC ORACLE OPTION (ORACA=YES);
+EXEC SQL BEGIN DECLARE SECTION;
+
+EXEC SQL INCLUDE var_oracle.h;
+
+EXEC SQL INCLUDE var_oracle_sgenera_mavt.h;
+
+EXEC SQL END DECLARE SECTION;
+
+#include "sgenera_mavt.h"
+
+/*
+            PROGRAMA PRINCIPAL
+			                            */ 
+
+main( int n, char*v[] ) 
+{
+
+printf("\n ===========Inicio============");
+  if ((directorio_log=getenv("LOG")) == NULL)
+  	{
+      	printf("\n FALTA VARIABLE ENTORNO LOG con el directorio del fichero log");
+      	exit(1);
+	}
+ 
+  if ((crea_fichero_log() !=0))
+	{
+       	exit(2);
+	}
+
+  if ((Conecta_oracle() !=0))
+	{
+		sprintf (mensaje,"\nERROR CONEXION CON ORACLE\n");
+		escribe_error(mensaje);
+		printf("%s",mensaje);
+	   exit(2); 
+	}
+
+   /* SE COMPRUEBAN LOS PARAMETROS */
+    if ( n < 4) 
+    {
+      sprintf(mensaje,"\nFaltan Parametros : Fecha_referencia YYYYMMDD Fecha_entrada_vigor DD/MM/YY Divisa N.");
+      escribe_error(mensaje); 		       
+      printf("%s",mensaje);
+      printf("\n[0-No se generan localiz/ 1-Si se generan localiz]Opcional,por defecto=1");
+      exit(2);
+   }
+   
+   /*(2004/06/28) Si se aniade un parametro adicional=1 indica que no se generan los*/
+   /*ficheros de localizacion																			*/
+	if ( n == 5)
+	{
+		localiza = atoi(v[4]);	
+	
+	}
+
+
+   if ( !Capturar_parametros("PRECIO_SOPORTE_7C",(char*)o_soporte_7C.arr) ||
+   	!Capturar_parametros("DIR_FICH_CONFIG",path_ficheros) ||
+        (!Capturar_parametros("DIR_DEST_MAVT",(char*)o_directorio_destino.arr)))
+     	{
+        exit(1);
+     	}
+	o_directorio_destino.len=strlen((char*)o_directorio_destino.arr);
+	o_directorio_destino.arr[o_directorio_destino.len]='\0';
+	
+	
+  //Operaciones previas
+
+   strcpy((char*)o_fecha_referencia.arr,v[1]);
+   o_fecha_referencia.len=strlen((char*)o_fecha_referencia.arr);
+   strcpy((char*)o_fecha_entrada_vigor.arr,v[2]);
+   o_fecha_entrada_vigor.len=strlen((char*)o_fecha_entrada_vigor.arr);
+
+   if (Dame_indice_tarifa() !=0)
+       return(1);
+       
+   printf("%d", o_numero_tarifa);
+   fflush(stdout);
+
+   o_divisa  =atoi(v[3]);   
+   strcpy(comentario_met,"!--------------------------------------------------------------------!");
+comentario_met[75]='\0';
+   sprintf(mensaje," *****   GENERANDO FICHEROS PARA TARIFA  : %d   *****",o_indice_tarifa);
+   escribe_error(mensaje);
+
+	if (//(Genera_fichero_tarifas() != 0) ||
+	    (Genera_fichero_lineas() != 0)  ||
+			(Genera_fichero_sincontacto() != 0) ||
+			(Genera_fichero_contactless() != 0) ||      
+			(Genera_fichero_param_sw() != 0) ||
+			//(Genera_fichero_unidades_viaje() != 0) ||
+			(Genera_fichero_unidades_transporte_centimo() != 0)
+			)
+	{
+			printf("\n*** ERROR EN EL PROCESO -FICHEROS GENERICOS-***\n");
+			exit(1);
+	}
+              
+	if (localiza==1)
+	{
+		if (Genera_fichero_localiza() != 0)
+		{
+			printf("\n*** ERROR EN EL PROCESO -FICHEROS LOCALIZ-***\n");
+			exit(1);
+		
+		}
+	
+	}
+	
+	if (prepara_envio(localiza)!=0)
+	{
+		printf("\n*** ERROR EN EL PROCESO -PREPARA ENVIO-***\n");
+		exit(2);
+	
+	}
+	       
+	Realiza_commit();
+ 
+printf("\n============Fin=============\n");
+exit(0);
+}
+
+ 
+/************************************************************************
+
+                      FUNCIONES
+
+************************************************************************/
+/************************************************************************
+  BUSCA LA TARIFA QUE ESTA EN VIGOR PARA LA FECHA DE REFERENCIA 
+************************************************************************/
+int Dame_indice_tarifa()
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("BUSCA INDICE TARIFA"); 
+oraca.orastxtf = ORASTFERR;
+
+EXEC SQL  SELECT DISTINCT INDICE, NUMERO_TARIFA INTO :o_indice_tarifa, :o_numero_tarifa
+	   FROM INDICE_TARIFAS A 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD');
+
+
+return (sqlca.sqlcode);
+    
+}
+/************************************************************************
+ DECLARA EL CURSOR PARA LAS ESTACIONES  (Lineas.dat)
+ Y BUSCA EL TOTAL DE ESTACIONES
+************************************************************************/
+int Declara_cursor_estaciones()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR LINEAS"); 
+oraca.orastxtf = ORASTFERR;
+
+
+EXEC SQL 
+   DECLARE CE  CURSOR FOR
+	    SELECT ESTACION_NUM, TRANSLATE(DESCRIPCION,' ','#'),
+	     to_number(decode(LINEA,'A',1,'B',2,'C',3,'D',4))
+	       FROM ESTACIONES A 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  ORDER BY 1;
+
+
+EXEC SQL OPEN CE;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR LINEAS");
+ return(1);
+}
+EXEC SQL  SELECT COUNT(*) INTO :o_total_elementos
+	   FROM ESTACIONES A 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD');
+
+return (sqlca.sqlcode);
+}
+
+/************************************************************************
+ DECLARA EL CURSOR PARA LAS LINEAS  (Lineas.dat)
+ Y BUSCA EL TOTAL DE LINEAS
+************************************************************************/
+int Declara_cursor_lineas()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR LINEAS"); 
+oraca.orastxtf = ORASTFERR;
+
+
+EXEC SQL 
+   DECLARE CL  CURSOR FOR
+	    SELECT to_number(decode(LINEA,'A',1,'B',2,'C',3,'D',4)),
+	           TRANSLATE(DESCRIPCION,' ','#')
+	       FROM LINEAS A 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  ORDER BY 1;
+
+
+EXEC SQL OPEN CL;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+EXEC SQL  SELECT COUNT(*) INTO :o_total_elementos
+	   FROM LINEAS A 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD');
+
+return (sqlca.sqlcode);
+}
+
+/************************************************************************
+ DECLARA EL CURSOR PARA LA MATRIZ TRIANGULAR DE TARIFAS EN FICHERO (Lineas.dat)
+************************************************************************/
+int Declara_cursor_matriz_tarifas()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR TARIFAS"); 
+oraca.orastxtf = ORASTFERR;
+
+// PTE ........................... 
+
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+return (sqlca.sqlcode);
+}
+
+/************************************************************************
+ DECLARA EL CURSOR PARA LOS TITULOS QUE VAN EN EL FICHERO  (Tarifas.new)
+ Y BUSCA EL TOTAL DE ELEMENTOS
+************************************************************************/
+int Declara_cursor_tit_tarifas()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR TARIFAS_TITULOS"); 
+oraca.orastxtf = ORASTFERR;
+
+
+EXEC SQL 
+   DECLARE CTT  CURSOR FOR
+	    SELECT TITULO, TRANSLATE(DESCRIPCION,' ','#'),
+	           TRANSLATE(ABREVIATURA,' ','#'), nvl(MASCARA_IMP_MAVT,1)
+	       FROM TITULOS A 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND
+	     MAG_SC = 'M' AND
+	     MAVT = 1 ORDER BY ORDEN_MAVT ASC;
+
+
+EXEC SQL OPEN CTT;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+EXEC SQL  SELECT COUNT(*) INTO :o_total_elementos
+	   FROM TITULOS A 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND
+	     MAG_SC = 'M' AND
+	     MAVT = 1;
+
+
+return (sqlca.sqlcode);
+}
+
+
+/************************************************************************
+ DECLARA EL CURSOR PARA LAS DISTINTAS TARIFAS DE UN TITULO (Tarifas.new)
+ EN EL INDICE ACTUAL DE TARIFAS 
+ Y BUSCA EL TOTAL DE ELEMENTOS
+ SI LA DIVISA ES EN EUROS (1) SE PASA EL PRECIO EN CENTES. EURO
+
+************************************************************************/
+int Declara_cursor_precios_titulos()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR PRECIOS_TITULOS"); 
+oraca.orastxtf = ORASTFERR;
+
+EXEC SQL 
+   DECLARE CPT  CURSOR FOR
+	    SELECT DECODE(:o_divisa,1,PRECIO*100,PRECIO)
+	       FROM TARIFAS A 	    
+	   WHERE 
+	     A.NUMERO_TARIFA = :o_numero_tarifa  AND 
+	     A.TITULO = :o_titulo AND 
+	     A.MONEDA = DECODE(:o_divisa,1,'U',A.MONEDA) AND
+	     MAG_SC = 'M' ORDER BY 1;
+ 
+
+EXEC SQL OPEN CPT;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+} 
+o_total_elementos = 0; 
+EXEC SQL  SELECT COUNT(*) INTO :o_total_elementos
+	       FROM TARIFAS A 	    
+	   WHERE 
+	     A.NUMERO_TARIFA = :o_numero_tarifa  AND 
+	     A.TITULO = :o_titulo AND 
+	     A.MONEDA = DECODE(:o_divisa,1,'U',A.MONEDA) AND
+	     MAG_SC = 'M';
+
+
+
+return (sqlca.sqlcode);
+}
+
+
+/************************************************************************
+DECLARA EL CURSOR PARA LAS DESCRIPCIONES DE TITULOS EN LOS DISTINTOS
+IDIOMAS DEFINIDOS
+************************************************************************/
+int Declara_cursor_layouts()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR LAYOUTS TITULOS"); 
+oraca.orastxtf = ORASTFERR;
+
+
+EXEC SQL 
+   DECLARE CLAY  CURSOR FOR
+	    SELECT TRANSLATE(TRANSLATE(TRANSLATE(DESCRIPCION_1,' ','#'), '_', '-'), '@', ' '), 
+	    TRANSLATE(TRANSLATE(TRANSLATE(DESCRIPCION_2,' ','#'), '_', '-'), '@', ' '), 
+	    TRANSLATE(TRANSLATE(TRANSLATE(DESCRIPCION_3,' ','#'), '_', '-'), '@', ' '),
+	    TRANSLATE(TRANSLATE(TRANSLATE(DESCRIPCION_4,' ','#'), '_', '-'), '@', ' ')
+       FROM LAYOUTS_TITULOS A 	    
+		 WHERE TITULO = :o_titulo and TIPO_EQUIPO='A' and MAG_SC='M' order by ORDEN;
+
+EXEC SQL OPEN CLAY;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+return (sqlca.sqlcode);
+}
+
+
+/************************************************************************
+DECLARA EL CURSOR PARA LAS DESCRIPCIONES DE TITULOS SC EN LOS DISTINTOS
+IDIOMAS DEFINIDOS
+************************************************************************/
+int Declara_cursor_layouts_sc()
+
+{
+/*EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR LAYOUTS TITULOS SC"); 
+oraca.orastxtf = ORASTFERR;*/
+EXEC SQL WHENEVER SQLERROR CONTINUE;
+EXEC SQL WHENEVER NOT FOUND CONTINUE;
+
+EXEC SQL 
+   DECLARE CLAY_SC  CURSOR FOR
+	    SELECT NVL(TRANSLATE(TRANSLATE(TRANSLATE(DESCRIPCION_1,' ','#'), '_', '-'), '@', ' '),'XXXX') , 
+	    NVL(TRANSLATE(TRANSLATE(TRANSLATE(DESCRIPCION_2,' ','#'), '_', '-'), '@', ' '),'#') , 
+	    NVL(TRANSLATE(TRANSLATE(TRANSLATE(DESCRIPCION_3,' ','#'), '_', '-'), '@', ' '),'#') ,
+	    NVL(TRANSLATE(TRANSLATE(TRANSLATE(DESCRIPCION_4,' ','#'), '_', '-'), '@', ' '),'#')
+       FROM LAYOUTS_TITULOS A 	    
+		 WHERE TITULO = :o_titulo and TIPO_EQUIPO='A' and MAG_SC='S' order by ORDEN;
+
+EXEC SQL OPEN CLAY_SC;
+
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+return(sqlca.sqlcode);
+}
+
+/*************************************************************************/
+
+int Declara_cursor_layouts_rollo()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR LAYOUTS TITULOS rollo"); 
+oraca.orastxtf = ORASTFERR;
+
+
+EXEC SQL 
+   DECLARE CLAY_ROLLO  CURSOR FOR
+	    SELECT TRANSLATE(TRANSLATE(TRANSLATE(DESCRIPCION_1,' ','#'), '_', '-'), '@', ' '), 
+	    TRANSLATE(TRANSLATE(TRANSLATE(DESCRIPCION_2,' ','#'), '_', '-'), '@', ' '), 
+	    TRANSLATE(TRANSLATE(TRANSLATE(DESCRIPCION_3,' ','#'), '_', '-'), '@', ' '),
+	    TRANSLATE(TRANSLATE(TRANSLATE(DESCRIPCION_4,' ','#'), '_', '-'), '@', ' ')
+       FROM LAYOUTS_TITULOS A 	    
+		 WHERE TITULO = :o_titulo and TIPO_EQUIPO='A' and MAG_SC='M' order by ORDEN;
+
+EXEC SQL OPEN CLAY_ROLLO;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+return (sqlca.sqlcode);
+}
+
+
+/************************************************************************
+ CAPTURA PARAMETROS PARA EL FICHERO PARAM_SW.DAT
+ SON TODOS AQUELLOS PARAMETROS DE EJECUCION CON NOMBRE %_PMAVT
+************************************************************************/
+int Obtiene_param_sw()
+
+{
+   if ( !Capturar_parametros("INF_DISCO_PMAVT",inf_disco) ||
+        !Capturar_parametros("DIV_CAMBIO_PMAVT",div_cambio) ||
+		  !Capturar_parametros("NUM_RECAR_PMAVT",num_recar_1) ||
+		  !Capturar_parametros("NUM_HOPPERS_PMAVT",num_hoppers) ||
+        !Capturar_parametros("INF_HOPPER_1_PMAVT",inf_hopper_1) ||	
+		  !Capturar_parametros("INF_HOPPER_2_PMAVT",inf_hopper_2) ||
+        !Capturar_parametros("INF_HOPPER_3_PMAVT",inf_hopper_3) ||		
+		  !Capturar_parametros("INF_HOPPER_4_PMAVT",inf_hopper_4) ||
+        !Capturar_parametros("NUM_CAJ_REC_PMAVT",num_caj_rec) ||
+        !Capturar_parametros("INF_CAJA_PMAVT",inf_caja) ||
+        !Capturar_parametros("INF_BILLETERO_PMAVT",inf_billetero) ||
+        !Capturar_parametros("DIV_ACEPTACION_PMAVT",div_aceptacion) ||
+		  !Capturar_parametros("MON_1_PMAVT",mon_1) ||
+        !Capturar_parametros("MON_2_PMAVT",mon_2) ||	
+		  !Capturar_parametros("MON_3_PMAVT",mon_3) ||
+        !Capturar_parametros("MON_4_PMAVT",mon_4) ||		
+		  !Capturar_parametros("MON_5_PMAVT",mon_5) ||
+        !Capturar_parametros("MON_6_PMAVT",mon_6) ||
+		  !Capturar_parametros("MON_7_PMAVT",mon_7) ||
+        !Capturar_parametros("MON_8_PMAVT",mon_8) ||	
+		  !Capturar_parametros("MON_9_PMAVT",mon_9) ||
+        !Capturar_parametros("MON_10_PMAVT",mon_10) ||		
+		  !Capturar_parametros("BIL_1_PMAVT",bil_1) ||
+        !Capturar_parametros("BIL_2_PMAVT",bil_2) ||
+		  !Capturar_parametros("BIL_3_PMAVT",bil_3) ||
+        !Capturar_parametros("BIL_4_PMAVT",bil_4) ||	
+		  !Capturar_parametros("BIL_5_PMAVT",bil_5) ||
+        !Capturar_parametros("BIL_6_PMAVT",bil_6) ||		
+		  !Capturar_parametros("BIL_7_PMAVT",bil_7) ||
+        !Capturar_parametros("BIL_8_PMAVT",bil_8) ||
+		  !Capturar_parametros("BIL_9_PMAVT",bil_9) ||
+        !Capturar_parametros("BIL_10_PMAVT",bil_10) ||	
+		  !Capturar_parametros("INF_ROLLOS_PMAVT",inf_rollos) ||
+        !Capturar_parametros("SOP_TICK_CONTA_PMAVT",sop_tick_conta) ||		
+		  !Capturar_parametros("TEMPORIZADORES_PMAVT",temporizadores) ||
+        !Capturar_parametros("HORA_ENCENDIDO_PMAVT",hora_encendido) ||
+		  !Capturar_parametros("HORA_APAGADO_PMAVT",hora_apagado) ||
+        !Capturar_parametros("HORA_CIERRE_PMAVT",hora_cierre) ||	
+		  !Capturar_parametros("MEDIOS_PAGO_PMAVT",medios_pago) ||
+        !Capturar_parametros("IDIOMA_POR_DEF_PMAVT",idioma_por_def) ||		
+		  !Capturar_parametros("APAGADO_UPS_PMAVT",apagado_ups) ||
+        !Capturar_parametros("FEC_ACTIVACION_PMAVT",fec_activacion) ||
+		  !Capturar_parametros("FEC_DESACTIV_PMAVT",fec_desactiv) ||
+        !Capturar_parametros("DIR_COMODIN_PMAVT",dir_comodin) ||	
+		  !Capturar_parametros("PUERTO_COMODIN_PMAVT",puerto_comodin) ||
+        !Capturar_parametros("PUERTO_CONCEN_PMAVT",puerto_concen) ||
+        !Capturar_parametros("OFFSET_FIN_ROLLO",offset_fin_rollo) ||
+        !Capturar_parametros("DIAS_VAL_SOPO_CTLESS",dias_val_sopo_ctless) ||
+        !Capturar_parametros("DIAS_VAL_SOPO_7C",dias_val_sopo_7C) ||
+        		  !Capturar_parametros("USAR_ID_MAG_PMAVT",usar_id_mag)
+		)
+     	{
+			sprintf(mensaje,"Error al capturar parametros para el fichero param_sw");	
+			escribe_error(mensaje);
+			return(1);
+     	}
+printf("Hola hola %s\n", num_recar_1);
+return(0);
+
+
+}
+
+
+/************************************************************************
+OBTIENE EL PRECIO DE UN TITULO SIN CONTACTO
+¡¡OJO!!
+COMO NO TENEMOS DADOS DE ALTA TODOS LOS PRECIOS DE TSC Y PARA QUE 
+LA AUTOMATICA NO TENGA PROBLEMAS PONDREMOS COMO TARIFA 1 EURO PARA
+LOS TITULOS QUE NO TENEMOS TARIFA(VAN A SER CONTRATOS NO RECARGABLES
+EN LA MAVT).DEJAREMOS UNA TRAZA EN EL FICHERO DE LOG PARA SABER LOS PRECIOS
+FICTICIOS.
+************************************************************************/
+int obtiene_precios_titulo_sincontacto()
+
+{
+
+EXEC SQL SELECT DECODE(:o_divisa,1,PRECIO*100,PRECIO) INTO :o_precio
+	       FROM TARIFAS A 	    
+	   WHERE 
+	     A.NUMERO_TARIFA = :o_numero_tarifa  AND 
+	     A.TITULO = :o_titulo AND 
+	     A.MONEDA = DECODE(:o_divisa,1,'U',A.MONEDA) AND
+	     MAG_SC = 'S';
+
+if ((sqlca.sqlcode) == 1403)
+{
+	o_precio = 100;
+	sqlca.sqlcode = 0;
+   sprintf(mensaje,"Precio no dado de alta en BD.Titulo TSC %d(Num.Tarifa %d)",o_titulo,o_numero_tarifa);	
+	escribe_error(mensaje);
+}
+
+return (sqlca.sqlcode);
+}
+
+
+/************************************************************************
+OBTIENE EL PRECIO DE LOS TITULOS MAGNETICOS PARA MOSTRAR EN EL LAYOUT
+************************************************************************/
+int obtiene_precio_layout()
+
+{
+
+EXEC SQL SELECT DECODE(:o_divisa,1,PRECIO*100,PRECIO) INTO :o_precio_layout
+	       FROM TARIFAS A 	    
+	   WHERE 
+	     A.NUMERO_TARIFA = :o_numero_tarifa  AND 
+	     A.TITULO = :o_titulo AND 
+	     A.MONEDA = DECODE(:o_divisa,1,'U',A.MONEDA) AND
+	     MAG_SC = 'M';
+
+
+return (sqlca.sqlcode);
+}
+
+/************************************************************************
+OBTIENE EL PRECIO DE LOS TITULOS MAGNETICOS PARA MOSTRAR EN EL LAYOUT PARA SC
+¡¡OJO!!
+CUANDO EN LA BASE DE DATOS NO TENGAMOS DADO DE ALTA EL PRECIO DEJAREMOS
+UNA TRAZA EN EL FICHERO DE LOG PERO DAREMOS UN PRECIO DE 1 EURO PORQUE 
+LA MAVT REQUIERE EL FICHERO COMPLETO(SERAN CONTRATOS NO RECARGABLES EN LA MAVT)
+************************************************************************/
+int obtiene_precio_layout_sc()
+
+{
+
+EXEC SQL SELECT DECODE(:o_divisa,1,PRECIO*100,PRECIO) INTO :o_precio_layout
+	       FROM TARIFAS A 	    
+	   WHERE 
+	     A.NUMERO_TARIFA = :o_numero_tarifa  AND 
+	     A.TITULO = :o_titulo AND 
+	     A.MONEDA = DECODE(:o_divisa,1,'U',A.MONEDA) AND
+	     MAG_SC = 'S';
+
+if ((sqlca.sqlcode) == 1403)
+{
+	o_precio_layout = 100;
+	sqlca.sqlcode = 0;
+   /*sprintf(mensaje,"Precio no dado de alta en BD(Layout).Titulo TSC %d(Num.Tarifa %d)",o_titulo,o_numero_tarifa);	
+	escribe_error(mensaje);*/
+	
+}
+
+
+return (sqlca.sqlcode);
+}
+
+/*****************************************************************************/
+
+
+int obtiene_precio_layout_rollo()
+
+{
+
+EXEC SQL SELECT DECODE(:o_divisa,1,PRECIO*100,PRECIO) INTO :o_precio_layout
+	       FROM TARIFAS A 	    
+	   WHERE 
+	     A.NUMERO_TARIFA = :o_numero_tarifa  AND 
+	     A.TITULO = :o_titulo AND 
+	     A.MONEDA = DECODE(:o_divisa,1,'U',A.MONEDA) AND
+	     MAG_SC = 'M';
+
+if ((sqlca.sqlcode) == 1403)
+{
+	o_precio_layout = 100;
+	sqlca.sqlcode = 0;
+   sprintf(mensaje,"Precio no dado de alta en BD(Layout).Titulo TSC %d(Num.Tarifa %d)",o_titulo,o_numero_tarifa);	
+	escribe_error(mensaje);
+}
+
+
+return (sqlca.sqlcode);
+}
+
+
+/************************************************************************
+ DECLARA EL CURSOR PARA LAS MAVT  (Localiza.dat)
+ Y BUSCA EL TOTAL DE MAVT
+************************************************************************/
+int Declara_cursor_localiza()
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR LOCALIZA"); 
+oraca.orastxtf = ORASTFERR;
+
+
+EXEC SQL 
+   DECLARE CLO  CURSOR FOR
+	    SELECT A.MAVT,B.ESTACION_NUM,
+	           to_number(decode(A.ATRIO,'N',1,'S',2,'E',3,'O',4,'C',5,0)),
+	           A.NUMERO,A.NUMERO_SERIE, 
+	           to_number(decode(B.LINEA,'A',1,'B',2,'C',3,'D',4)),B.ZONA,3,'DDA',
+		        IP,DENTRO 
+	       FROM MAVT A, ESTACIONES B 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND
+	     A.ESTACION = B.ESTACION AND 
+	     B.FEC_INI <= A.FEC_INI AND B.FEC_FIN >= A.FEC_FIN ORDER BY 1;
+  
+
+EXEC SQL OPEN CLO;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+EXEC SQL  SELECT COUNT(*) INTO :o_total_elementos
+	       FROM MAVT A, ESTACIONES B 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND
+	     A.ESTACION = B.ESTACION AND 
+	     B.FEC_INI <= A.FEC_INI AND B.FEC_FIN >= A.FEC_FIN;
+
+return (sqlca.sqlcode);
+}
+
+/************************************************************************
+ DECLARA EL CURSOR PARA LOS TITULOS QUE VAN EN EL FICHERO  (SinContacto.new)
+ Y BUSCA EL TOTAL DE ELEMENTOS
+************************************************************************/
+int Declara_cursor_sincontacto()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR TARIFAS_TITULOS SIN CONTACTO"); 
+oraca.orastxtf = ORASTFERR;
+
+//Para los titulos sin contacto abriremos el cursor para todos los titulos no solo
+//para los que tengan el campo MAVT igual a 1.Luego pondremos un campo que sea
+//recargable a 1 o a 0 dependiendo de si es un contrato que se pueda cargar en la tarjeta o no.
+
+EXEC SQL 
+   DECLARE CTTS  CURSOR FOR
+   SELECT TITULO, TRANSLATE(DESCRIPCION,' ','#'),
+   TRANSLATE(ABREVIATURA,' ','#'), nvl(TIP_VAL_TEMP,0), nvl(VAL_TEMPORAL,0), NVL(MAX_RECARGA, 0), NVL(PERFIL_CONTRATO,0),
+   NVL(DESCARTABLE, 0), NVL(RECARGABLE_MAVT, 0), 0, TICK_OPER_CODE, VENTA_MAVT 
+   FROM TITULOS A 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND
+	     MAG_SC = 'S' AND MAVT = 1 AND DESCARTABLE IS NULL AND
+	     TITULO != 0
+	     ORDER BY ORDEN_MAVT ASC;
+
+
+EXEC SQL OPEN CTTS;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+o_total_elementos = 0;
+
+EXEC SQL  SELECT COUNT(*) INTO :o_total_elementos
+	   FROM TITULOS A 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND
+	     MAG_SC = 'S' AND MAVT = 1 AND DESCARTABLE IS NULL AND
+	     TITULO != 0;
+
+
+return (sqlca.sqlcode);
+}
+/*****************************************************************************/
+int Declara_cursor_unidades_viaje()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR UNIDADES DE VIAJE"); 
+oraca.orastxtf = ORASTFERR;
+
+//Para los titulos sin contacto abriremos el cursor para todos los titulos no solo
+//para los que tengan el campo MAVT igual a 1.Luego pondremos un campo que sea
+//recargable a 1 o a 0 dependiendo de si es un contrato que se pueda cargar en la tarjeta o no.
+
+EXEC SQL 
+   DECLARE CUV  CURSOR FOR
+   SELECT CUANTIA*100, UNIDADES_CREDITO
+   FROM DESCUENTOS_UNIDADES_CREDITO
+	    ORDER BY CUANTIA ASC;
+
+
+EXEC SQL OPEN CUV;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+return (sqlca.sqlcode);
+}
+
+/*****************************************************************************/
+int Declara_cursor_ventas_unidades_viaje()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR VENTAS UNIDADES DE VIAJE"); 
+oraca.orastxtf = ORASTFERR;
+
+//Para los titulos sin contacto abriremos el cursor para todos los titulos no solo
+//para los que tengan el campo MAVT igual a 1.Luego pondremos un campo que sea
+//recargable a 1 o a 0 dependiendo de si es un contrato que se pueda cargar en la tarjeta o no.
+
+EXEC SQL 
+   DECLARE CVUV  CURSOR FOR
+   SELECT PAGOS*100
+   FROM VENTAS_UNID_CREDITO
+	    ORDER BY PAGOS ASC;
+
+
+EXEC SQL OPEN CVUV;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+return (sqlca.sqlcode);
+}
+
+/*****************************************************************************/
+int Declara_cursor_unidades_viaje_centimo()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR UNIDADES DE VIAJE CENTIMO"); 
+oraca.orastxtf = ORASTFERR;
+
+
+EXEC SQL 
+   DECLARE CUVC  CURSOR FOR
+   SELECT CUANTIA*100, UNIDADES_CREDITO
+   FROM DESCUENTOS_UNID_CREDITO_CENT
+	    ORDER BY CUANTIA ASC;
+
+
+EXEC SQL OPEN CUVC;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+return (sqlca.sqlcode);
+}
+
+/*****************************************************************************/
+int Declara_cursor_ventas_unidades_viaje_centimo()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR VENTAS UNIDADES DE VIAJE"); 
+oraca.orastxtf = ORASTFERR;
+
+
+EXEC SQL 
+   DECLARE CVUVC  CURSOR FOR
+   SELECT PAGOS*100
+   FROM VENTAS_UNID_CREDITO_CENT
+	    ORDER BY PAGOS ASC;
+
+
+EXEC SQL OPEN CVUVC;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+return (sqlca.sqlcode);
+}
+/*******************************************************************************************/
+
+int Declara_cursor_7colinas()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR TARIFAS_TITULOS 7 COLINAS"); 
+oraca.orastxtf = ORASTFERR;
+
+//Para los titulos sin contacto abriremos el cursor para todos los titulos no solo
+//para los que tengan el campo MAVT igual a 1.Luego pondremos un campo que sea
+//recargable a 1 o a 0 dependiendo de si es un contrato que se pueda cargar en la tarjeta o no.
+
+EXEC SQL 
+   DECLARE CTTS_7  CURSOR FOR
+   SELECT TITULO, TRANSLATE(DESCRIPCION,' ','#'),
+   TRANSLATE(ABREVIATURA,' ','#'), nvl(TIP_VAL_TEMP,0), nvl(VAL_TEMPORAL,0), NVL(MAX_RECARGA, 0), NVL(PERFIL_CONTRATO,0),
+   NVL(DESCARTABLE, 0), NVL(RECARGABLE_MAVT, 0), 1, TICK_OPER_CODE, VENTA_MAVT
+   FROM TITULOS 	    
+	   WHERE 
+	     FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND
+	     MAG_SC = 'S' AND MAVT = 1 AND (DESCARTABLE = 1 OR TITULO = 824)
+	     ORDER BY ORDEN_MAVT ASC;
+
+
+EXEC SQL OPEN CTTS_7;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+o_total_elementos = 0;
+
+EXEC SQL  SELECT COUNT(*) INTO :o_total_elementos
+	   FROM TITULOS A 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND
+	     MAG_SC = 'S' AND MAVT = 1 AND (DESCARTABLE = 1 OR TITULO = 824);
+
+
+return (sqlca.sqlcode);
+}
+
+/************************************************************************************************/
+int Declara_cursor_rollo()
+
+{
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("DECLARE CURSOR TARIFAS_TITULOS ROLLO"); 
+oraca.orastxtf = ORASTFERR;
+
+
+EXEC SQL 
+   DECLARE CTTS_R  CURSOR FOR
+   SELECT TITULO, DECODE(titulo, 289, 32788, 305, 32789, 17, 32790, 298, 32791, 314, 32792), TRANSLATE(DESCRIPCION,' ','#'),
+   TRANSLATE(ABREVIATURA,' ','#'), nvl(TIP_VAL_TEMP,0), nvl(VAL_TEMPORAL,0), NVL(MAX_RECARGA, 0), NVL(PERFIL_CONTRATO,0),
+   NVL(DESCARTABLE, 0), NVL(RECARGABLE_MAVT, 0)
+   FROM TITULOS A 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND
+	     MAG_SC = 'M' AND MAVT = 1
+	     ORDER BY ORDEN_MAVT ASC;
+
+
+EXEC SQL OPEN CTTS_R;
+if (sqlca.sqlcode != 0)
+{
+ trata_error_oracle("DECLARE CURSOR");
+ return(1);
+}
+
+return (sqlca.sqlcode);
+}
+
+
+
+
+/************************************************************************
+ GENERA EL FICHERO DE LINEAS.dat
+ ************************************************************************/
+int Genera_fichero_lineas() 
+{
+ int orden_estacion; 
+ 
+  sprintf(nombre_fichero,"%sLineas.dat", path_ficheros);
+
+  if(!(config=fopen(nombre_fichero,"w")))
+  {
+    sprintf(mensaje,"\nError creando fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    return(1);
+  }
+
+    sprintf(mensaje,"Generando : %s",nombre_fichero);
+    escribe_error(mensaje);
+
+if (Declara_cursor_estaciones() != 0)
+	{
+	return(1);
+	}
+if  ((fprintf(config,"NUMERO_ESTACIONES	%d\n", o_total_elementos)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! CODIGO_ESTACION     Valor decimal \n")== EOF)
+        ||(fprintf(config,"! NOMBRE_ESTACION     Valor alfanumerico\n")== EOF)
+        ||(fprintf(config,"! TODOS LOS CAMPOS QUE NO SE COMPLETEN DEBEREMOS PONER UNA#\n")== EOF)
+        ||(fprintf(config,"! AL IGUAL QUE EN LOS ESPACIOS EN BLANCO ENTRE NOMBRES\n")== EOF)
+        ||(fprintf(config,"! P.E. ALCALA#DE#HENARES\n")== EOF)
+        ||(fprintf(config,"! LINEAS Las lineas a las que pertenecen las estaciones. Las líneas\n")== EOF)
+        ||(fprintf(config,"! se tienen que númerar desde el 01.\n")== EOF)
+        ||(fprintf(config,"!       LINEA A (GAVIOTA):              01\n")== EOF)
+        ||(fprintf(config,"!       LINEA B (GIRASOL):              02\n")== EOF)
+        ||(fprintf(config,"!       LINEA C (CARAVELA):             03\n")== EOF)
+        ||(fprintf(config,"!       LINEA D (ORIENTE):              04\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF))
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  orden_estacion = 1;
+  while(Leer_ce() == 0)
+  {
+if  ((fprintf(config,"\n!ORDEN	%d\n", orden_estacion)== EOF)
+        ||(fprintf(config,"CODIGO_ESTACION     %03d 	LINEAS %02d\n",o_estacion,o_linea)== EOF)
+        ||(fprintf(config,"NOMBRE_ESTACION     %s # #\n",o_nombre.arr)== EOF)) //pte nombre abreviado
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+
+
+   orden_estacion = orden_estacion + 1;
+  }//del while      
+   
+EXEC SQL CLOSE CE; 
+
+   if (Inserta_matriz_tarifas() != 0)
+        return(1);
+   Inserta_lineas();
+      
+   fclose(config);
+
+return(0);
+}
+
+/*************************************************************************
+INSERTA LA MATRIZ DE TARIFAS
+*************************************************************************/
+int Inserta_matriz_tarifas()
+{
+int i,j,y;
+
+if  ((fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! MATRIZ TRIANGULAR DE TARIFAS. EL ORDEN ES EL DE LAS ESTACIONES\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF))
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+      
+  
+  //Como de momento no hay definidas distintas tarifas para distintos origen-destino.
+  //Vamos a generar una matriz para que la lea la automatica con una sola tarifa para todas las
+  //posibles parejas origen-destino.
+	
+  //Hallamos el numero de tarifa
+  if (Dame_indice_tarifa() != 0)
+  {
+    	sprintf(mensaje,"\nError hallando el numero de tarifa para escribir la matriz de tarifas");
+	   escribe_error(mensaje);
+  		return(1);
+  }  
+
+  //Pintamos la matriz sabiendo el total de estaciones y el numero de tarifa
+
+  y = o_total_elementos;
+
+  for(i=0; i < o_total_elementos; i++)
+  {
+		if(fprintf(config,"\nTARIFAS ")==EOF)
+		{
+			sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+			escribe_error(mensaje);
+			fclose(config);
+			exit(1);
+		}
+   
+	  for(j=0; j < y; j++)	  
+		{
+
+		  if(fprintf(config,"%02d ",o_numero_tarifa)==EOF)
+			{
+				sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+				escribe_error(mensaje);
+				fclose(config);
+				exit(1);
+			}
+
+		}
+  y = y-1;							
+  }	  	 
+
+  return(0);
+}
+
+/*************************************************************************
+INSERTA LAS LINEAS
+*************************************************************************/
+int Inserta_lineas()
+{
+if (Declara_cursor_lineas() != 0)
+	{
+	return(1);
+	}
+
+if  ((fprintf(config,"\n\nNUMERO_LINEAS 	%d\n\n", o_total_elementos)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! DEFINICION DE LAS LINEAS. PRIMER CAMPO EL NOMBRE. SEGUNDO EL CODIGO DE\n")== EOF)
+        ||(fprintf(config,"! LA LÍNEA.\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF))
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  while(Leer_cl() == 0)
+  {
+if  ((fprintf(config,"CODIGO_LINEA     %02d \n",o_linea)== EOF)
+   ||(fprintf(config,"NOMBRE_LINEA     %s\n\n",o_nombre.arr)== EOF))
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+
+
+  }//del while      
+   
+EXEC SQL CLOSE CL; 
+return(0);
+
+}
+
+/************************************************************************
+ GENERA EL FICHERO DE TARIFAS.NEW
+ ************************************************************************/
+int Genera_fichero_tarifas() 
+{
+  orden_titulo = 0;  
+  sprintf(nombre_fichero,"%sTarifas.new", path_ficheros);
+
+  if(!(config=fopen(nombre_fichero,"w")))
+  {
+    sprintf(mensaje,"\nError creando fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    return(1);
+  }
+
+    sprintf(mensaje,"Generando : %s",nombre_fichero);
+    escribe_error(mensaje);
+
+if (Declara_cursor_tit_tarifas() != 0)
+	{
+	return(1);
+	}
+if  ((fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! FECHA DE ENTRADA EN VIGOR DE LAS SIGUIENTES TARIFAS                  !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"FECHA_ENT_VIGOR %s\n\n",o_fecha_entrada_vigor.arr)== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! DIVISA EN QUE SE DEFINEN LAS TARIFAS 1 EUROS 2 ESCUDOS               !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"DIVISA_TARIFAS  %d\n\n",o_divisa)== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! INDICE QUE SE INCREMENTA CON CADA CAMBIO DE TARIFAS PARA AQUELLOS    !\n")== EOF)
+        ||(fprintf(config,"! BILLETES QUE NO CADUCAN                                              !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"INDICE_TARIFAS   %d\n\n",o_indice_tarifa)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! NUMERO TOTAL DE TARIFAS QUE SE DETALLAN (TITULOS LOGICOS)            !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"NUMERO_TITULOS  %d\n\n",o_total_elementos)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! SI EL DESPLAZAMIENTO ES 0 LAS TECLAS SIEMPRE SON FISICAS Y OCUPAN EL !\n")== EOF)
+        ||(fprintf(config,"! MISMO SITIO EN LA PANTALLA. SI ES 1, Y ALGUN SOPORTE SE AGOTA, LOS   !\n")== EOF)
+        ||(fprintf(config,"! TITULOS SE DESPLAZARIAN.                                             !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"DESPLAZAMIENTO_DE_TITULOS  1\n\n")== EOF) //fijo
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! NUMERO DE SOPORTES                                                   !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"NUMERO_TOTAL_SOPORTES   1\n\n")== EOF) //fijo
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! AHORA EMPIEZA LA DESCRIPCIÓN DE CADA UNO DE LOS TITULOS LOGICOS      !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	 )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  while(Leer_ctt() == 0)
+  {
+     orden_titulo +=1;
+
+     if (Escribe_detalle_titulo() != 0)
+         return(1); 
+  
+  }//del while      
+   
+EXEC SQL CLOSE CTT; 
+      
+   fclose(config);
+
+return(0);
+}
+
+/************************************************************************
+  ESCRIBE EL DETALLE PARA EL TITULO
+************************************************************************/
+int Escribe_detalle_titulo()
+{
+
+if  ((fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!------- TITULO : %d º                !\n",orden_titulo)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! TIPO DEL TÍTULO (TARIFA -> TITULO LOGICO)                            !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nTIPO_TITULO                     %04d\n",o_titulo)== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! LA VENTA MULTIPLE NOS INDICA LA CANTIDAD MAXIMA DE TITULOS QUE SE    !\n")== EOF)
+        ||(fprintf(config,"! PUEDEN VENDER DE UNA SOLA VEZ. SI ES 0/1 COMO MÁXIMO UN TÍTULO.      !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nVENTA_MULTIPLE                               9\n\n")== EOF) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! SI TIENE DESTINO VARIABLE TIENE UN 1 SINO UN 0. ESTO IMPLICARIA TENER!\n")== EOF)
+        ||(fprintf(config,"! DISTINTAS ZONAS Y PRECIOS ASOCIADOS.                                 !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nDESTINO_VARIABLE        0\n\n")== EOF) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! TITULO PERSONALIZADO 1:SI 0:NO                                       !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nTITULO_PERSONALIZADO            0\n\n")== EOF) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! TEXTOS ASOCIADOS AL TITULO                                           !\n")== EOF)
+        ||(fprintf(config,"! TEXTO CASTELLANO / INGLES / FRANCES / ALEMAN                         !\n")== EOF)
+        ||(fprintf(config,"! ES OBLIGATORIO RELLENAR LOS CUATRO CAMPOS DE TEXTO, SI NO EXISTEN    !\n")== EOF)
+        ||(fprintf(config,"! HAY QUE RELLENARLOS CON #                                            !\n")== EOF)
+        ||(fprintf(config,"! LOS TRES PRIMEROS TEXTOS PUEDEN APARECER EN LA TECLA SOCIADA AL      !\n")== EOF)
+        ||(fprintf(config,"! TITULO. EL ULTIMO SE ASOCIA COMO ABREVIATURA PARA LAS ULTIMAS        !\n")== EOF)
+        ||(fprintf(config,"! OPERACIONES                                                          !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  )
+     {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+      }
+//Se escriben los layouts de los titulos que definio Rofolfo con la ayuda de ML
+//Ademas hayamos el precio correspondiente del titulo para el numero de tarifa
+    if (Escribe_layout() !=0) 
+	      return(1); 
+
+	 if  ((fprintf(config,"\n%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! SI DESTINO VARIABLES ESTA A 1 INDICA QUE TENDREMOS MAS DE UN PRECIO  !\n")== EOF)
+        ||(fprintf(config,"! ASOCIADO A ESTA TARIFA                                               !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF))
+     {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+      }
+
+// Se escriben los distintos precios 
+     if (Escribe_detalle_precios(1) != 0)
+         return(1); 
+
+     if (Escribe_titulos_fisicos() != 0)
+         return(1); 
+return(0);
+}
+
+/*************************************************************************************
+SE ESCRIBEN LOS LAYOUTS DE LOS TITULOS 
+************************************************************************************/
+int Escribe_layout() 
+{
+ if (obtiene_precio_layout()!=0)
+	{
+	return(1);
+	}
+
+  if (Declara_cursor_layouts() != 0)
+	{
+	return(1);
+	}
+	
+//Habra que poner un control en la tabla o en el forms correspondiente de layouts_titulos
+//para controlar que cada titulo tenga 4 layouts(PR,ES,EN,FR)  
+  while(Leer_clay() == 0)
+  {
+		 if ((fprintf(config,"\nTEXTO %s %s %d,%02d %s %s",(char*)o_desc_1.arr,(char*)o_desc_2.arr,(o_precio_layout/100),(o_precio_layout%100),(char*)o_desc_3.arr,(char*)o_desc_4.arr)== EOF))
+       {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+        }
+      
+  }//del while
+      
+EXEC SQL CLOSE CLAY; 
+
+	 	 return(0); 			  		  
+}
+
+/*************************************************************************************
+SE ESCRIBEN LOS LAYOUTS DE LOS TITULOS SC
+************************************************************************************/
+int Escribe_layout_rollo() 
+{
+ if (obtiene_precio_layout_rollo()!=0)
+	{
+	return(1);
+	}
+
+  if (Declara_cursor_layouts_rollo() != 0)
+	{
+	return(1);
+	}
+	
+	
+	
+//Habra que poner un control en la tabla o en el forms correspondiente de layouts_titulos
+//para controlar que cada titulo tenga 4 layouts(PR,ES,EN,FR)  
+  while(Leer_clay_rollo() == 0)
+  {
+		  
+		 if ((fprintf(config,"\nTEXTO %s %s %d,%02d %s %s",(char*)o_desc_1.arr,(char*)o_desc_2.arr,(o_precio_layout/100),(o_precio_layout%100),(char*)o_desc_3.arr,(char*)o_desc_4.arr)== EOF))
+       {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+        }
+      
+  }//del while
+      
+EXEC SQL CLOSE CLAY_ROLLO; 
+
+	 	 return(0); 			  		  
+}
+
+/*******************************************************************************************************************/
+
+int Escribe_layout_sc() 
+{
+ if (obtiene_precio_layout_sc()!=0)
+	{
+	return(1);
+	}
+	
+ if (Declara_cursor_layouts_sc() != 0)
+	{
+	return(1);
+	}
+	
+	
+	
+//Habra que poner un control en la tabla o en el forms correspondiente de layouts_titulos
+//para controlar que cada titulo tenga 4 layouts(PR,ES,EN,FR)  
+  while(Leer_clay_sc() == 0)
+  {
+	
+	if(o_titulo == 824)
+	{
+	 	 if ((fprintf(config,"\nTEXTO %s   	      %s     -   %s %s",(char*)o_desc_1.arr,(char*)o_desc_2.arr, (char*)o_desc_3.arr,(char*)o_desc_4.arr)== EOF))
+       		{
+        		sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        		escribe_error(mensaje);
+        		fclose(config);
+        		exit(1);
+        	}
+	}
+	else
+	{	  
+		 if ((fprintf(config,"\nTEXTO %s %s %d,%02d %s %s",(char*)o_desc_1.arr,(char*)o_desc_2.arr,(o_precio_layout/100),(o_precio_layout%100),(char*)o_desc_3.arr,(char*)o_desc_4.arr)== EOF))
+       		{
+        		sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        		escribe_error(mensaje);
+        		fclose(config);
+        		exit(1);
+        	}
+        }//fin else
+      
+  }//del while
+      
+EXEC SQL CLOSE CLAY_SC; 
+
+	 	 return(0); 			  		  
+}
+
+/************************************************************************
+  ESCRIBE EL DETALLE PARA EL TITULO 7 COLINAS
+************************************************************************/
+int Escribe_detalle_titulo_7colinas()
+{
+
+// Se obtienen los distintos precios 
+//printf("\nPaso 1.Titulo %d",o_titulo);
+  if (obtiene_precios_titulo_sincontacto() != 0)
+	{
+	return(1);
+	}
+
+//printf("\nPaso 2.Titulo %d",o_titulo);
+
+if(o_titulo == 8141)
+  {
+  	o_titulo_sc = 33582;
+  } 
+  /*
+  if(o_titulo == 8221)
+  {
+  	o_titulo_sc = 33590;
+  }*/
+  
+
+
+if  ((fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!------- TITULO : %d º                                                 !\n",orden_titulo)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! TIPO DEL TÍTULO (TARIFA -> TITULO LOGICO)                            !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nTIPO_TITULO                     %04d\n",o_titulo_sc)== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! El precio en centimos de euro   												  !\n")== EOF)
+		  ||(fprintf(config,"%s\n" ,comentario_met)== EOF)
+	     ||(fprintf(config,"PRECIO %d\n" ,o_precio)== EOF)		  
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! TEXTOS ASOCIADOS AL TITULO                                           !\n")== EOF)
+        ||(fprintf(config,"! TEXTO CASTELLANO / INGLES / FRANCES / ALEMAN                         !\n")== EOF)
+        ||(fprintf(config,"! ES OBLIGATORIO RELLENAR LOS CUATRO CAMPOS DE TEXTO, SI NO EXISTEN    !\n")== EOF)
+        ||(fprintf(config,"! HAY QUE RELLENARLOS CON #                                            !\n")== EOF)
+        ||(fprintf(config,"! LOS TRES PRIMEROS TEXTOS PUEDEN APARECER EN LA TECLA SOCIADA AL      !\n")== EOF)
+        ||(fprintf(config,"! TITULO. EL ULTIMO SE ASOCIA COMO ABREVIATURA PARA LAS ULTIMAS        !\n")== EOF)
+        ||(fprintf(config,"! OPERACIONES                                                          !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF))
+     {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+      }
+//printf("\nPaso 3.Titulo %d",o_titulo);
+		//Se escriben los layouts de los titulos que definio Rofolfo con la ayuda de ML
+		//Ademas hayamos el precio correspondiente del titulo para el numero de tarifa
+		if (Escribe_layout_sc() !=0) 
+				return(1); 
+//printf("\nPaso 4.Titulo %d",o_titulo);
+		if ((fprintf(config,"\n%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! NUMERO DE DIAS O MESES QUE RECARGAN                                  !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nNUMERO_UNIDADES                %d\n",o_val_temporal)== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! LA VALIDEZ PUEDE COMENZAR EN EL MOMENTO DE LA RECARGA(1) O EN LA     !\n")== EOF)
+        ||(fprintf(config,"! PRIMERA UTILIZACION (2).                                             !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     
+	     ||(fprintf(config,"\nCOMIENZO_VALIDEZ                %d\n",1)== EOF) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     
+        ||(fprintf(config,"! NUMERO MAXIMO DE MESES O DIAS QUE SE PUEDEN RECARGAR				     !\n")== EOF)		  
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     	
+	     ||(fprintf(config,"\nMAXIMO_RECARGA                  %d\n",o_max_recarga)== EOF) //fijo		  
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     	
+        ||(fprintf(config,"! DICE SI ESTE CONTRATO SE PUEDE RECARGAR (1) O NO (0)				     !\n")== EOF)		  
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     	
+	     ||(fprintf(config,"\nRECARGABLE                  %d\n",o_recargable)== EOF)
+	     ||(fprintf(config,"\n%s\n",comentario_met)== EOF))
+	     {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+      }
+	     
+	     if(o_descartable == 0)
+	     {(fprintf(config,"\n!NOS DICE EL PERFIL DEL CONTRATO. 0=NINGUNO\n!")== EOF)
+	     ||(fprintf(config,"\n%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nPERFIL			%d\n", o_perfil_contrato)== EOF); 		  
+	     }
+     
+     
+      
+//printf("\nPaso 5.Titulo %d",o_titulo);
+return(0);
+}
+
+/************************************************************************
+  ESCRIBE EL DETALLE PARA EL TITULO 7 COLINAS PARA FICHERO CONTACTLESS
+************************************************************************/
+int Escribe_detalle_titulo_7colinas_Contactless()
+{
+
+// Se obtienen los distintos precios 
+//printf("\nPaso 1.Titulo %d",o_titulo);
+  if (obtiene_precios_titulo_sincontacto() != 0)
+	{
+	return(1);
+	}
+
+//printf("\nPaso 2.Titulo %d",o_titulo);
+
+if(o_titulo == 8141)
+  {
+  	o_titulo_sc = 33582;
+  } 
+ /* 
+  if(o_titulo == 8221)
+  {
+  	o_titulo_sc = 33590;
+  }*/
+  
+
+
+if  ((fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!------- TITULO : %d º                                                 !\n",orden_titulo)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! TIPO DEL TÍTULO (TARIFA -> TITULO LOGICO)                            !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nTIPO_TITULO                     %04d\n",o_titulo_sc)== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	||(fprintf(config,"! OPERADOR: tick_oper_code")== EOF)
+	||(fprintf(config,"\nOPERADOR                     %02d\n",o_tick_oper_code)== EOF)
+	||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! El precio en centimos de euro   												  !\n")== EOF)
+		  ||(fprintf(config,"%s\n" ,comentario_met)== EOF)
+	     ||(fprintf(config,"PRECIO %d\n" ,o_precio)== EOF)		  
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! TEXTOS ASOCIADOS AL TITULO                                           !\n")== EOF)
+        ||(fprintf(config,"! TEXTO CASTELLANO / INGLES / FRANCES / ALEMAN                         !\n")== EOF)
+        ||(fprintf(config,"! ES OBLIGATORIO RELLENAR LOS CUATRO CAMPOS DE TEXTO, SI NO EXISTEN    !\n")== EOF)
+        ||(fprintf(config,"! HAY QUE RELLENARLOS CON #                                            !\n")== EOF)
+        ||(fprintf(config,"! LOS TRES PRIMEROS TEXTOS PUEDEN APARECER EN LA TECLA SOCIADA AL      !\n")== EOF)
+        ||(fprintf(config,"! TITULO. EL ULTIMO SE ASOCIA COMO ABREVIATURA PARA LAS ULTIMAS        !\n")== EOF)
+        ||(fprintf(config,"! OPERACIONES                                                          !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF))
+     {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+      }
+//printf("\nPaso 3.Titulo %d",o_titulo);
+		//Se escriben los layouts de los titulos que definio Rofolfo con la ayuda de ML
+		//Ademas hayamos el precio correspondiente del titulo para el numero de tarifa
+		if (Escribe_layout_sc() !=0) 
+				return(1); 
+//printf("\nPaso 4.Titulo %d",o_titulo);
+		if ((fprintf(config,"\n%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! NUMERO DE DIAS O MESES QUE RECARGAN                                  !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nNUMERO_UNIDADES                %d\n",o_val_temporal)== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! LA VALIDEZ PUEDE COMENZAR EN EL MOMENTO DE LA RECARGA(1) O EN LA     !\n")== EOF)
+        ||(fprintf(config,"! PRIMERA UTILIZACION (2).                                             !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     
+	     ||(fprintf(config,"\nCOMIENZO_VALIDEZ                %d\n",1)== EOF) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     
+        ||(fprintf(config,"! NUMERO MAXIMO DE MESES O DIAS QUE SE PUEDEN RECARGAR				     !\n")== EOF)		  
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     	
+	     ||(fprintf(config,"\nMAXIMO_RECARGA                  %d\n",o_max_recarga)== EOF) //fijo		  
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     	
+        ||(fprintf(config,"! DICE SI ESTE CONTRATO SE PUEDE RECARGAR (1) O NO (0)				     !\n")== EOF)		  
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     	
+	     ||(fprintf(config,"\nRECARGABLE                  %d\n",o_recargable)== EOF)
+	     ||(fprintf(config,"\n%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\n!NOS DICE EL PERFIL DEL CONTRATO. 0=NINGUNO\n!")== EOF)
+	     ||(fprintf(config,"\n%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nPERFIL			%d\n", o_perfil_contrato)== EOF)
+	     ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\n!DICE SI ESTE CONTRATO SE PUEDE VENDER (1) O NO (0)\n!")== EOF)
+	     ||(fprintf(config,"\n%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nVENTA			%d\n", o_venta)== EOF)
+	     ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\n!DICE SI ES UN CONTRATO VV 7C (1) O UN CONTRATO LV (0)\n!")== EOF)
+	     ||(fprintf(config,"\n%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nTIPO_CONTRATO_7C			%d\n", o_tipo_contrato_7C)== EOF))
+	     {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+      }
+	     
+	     
+return(0);
+}
+
+/****************************************************************************************/
+
+int Escribe_detalle_titulo_rollo()
+{
+
+// Se obtienen los distintos precios 
+//printf("\nPaso 1.Titulo %d",o_titulo);
+  if (obtiene_precios_titulo_sincontacto() != 0)
+	{
+	return(1);
+	}
+	
+if(o_titulo == 8141)
+  {
+  	o_titulo_sc = 33582;
+  }
+/*
+if(o_titulo == 8221)
+{
+	o_titulo_sc = 33590;
+}*/
+
+//printf("\nPaso 2.Titulo %d",o_titulo);
+
+ 
+if  ((fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!------- TITULO : %d º                                                 !\n",orden_titulo)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! TIPO DEL TÍTULO (TARIFA -> TITULO LOGICO)                            !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nTIPO_TITULO                     %04d\n",o_titulo_sc)== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! El precio en centimos de euro   												  !\n")== EOF)
+		  ||(fprintf(config,"%s\n" ,comentario_met)== EOF)
+	     ||(fprintf(config,"PRECIO %d\n" ,o_precio)== EOF)		  
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! TEXTOS ASOCIADOS AL TITULO                                           !\n")== EOF)
+        ||(fprintf(config,"! TEXTO CASTELLANO / INGLES / FRANCES / ALEMAN                         !\n")== EOF)
+        ||(fprintf(config,"! ES OBLIGATORIO RELLENAR LOS CUATRO CAMPOS DE TEXTO, SI NO EXISTEN    !\n")== EOF)
+        ||(fprintf(config,"! HAY QUE RELLENARLOS CON #                                            !\n")== EOF)
+        ||(fprintf(config,"! LOS TRES PRIMEROS TEXTOS PUEDEN APARECER EN LA TECLA SOCIADA AL      !\n")== EOF)
+        ||(fprintf(config,"! TITULO. EL ULTIMO SE ASOCIA COMO ABREVIATURA PARA LAS ULTIMAS        !\n")== EOF)
+        ||(fprintf(config,"! OPERACIONES                                                          !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF))
+     {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+      }
+//printf("\nPaso 3.Titulo %d",o_titulo);
+		//Se escriben los layouts de los titulos que definio Rofolfo con la ayuda de ML
+		//Ademas hayamos el precio correspondiente del titulo para el numero de tarifa
+		if (Escribe_layout_sc() !=0) 
+				return(1); 
+//printf("\nPaso 4.Titulo %d",o_titulo);
+		if ((fprintf(config,"\n%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! NUMERO DE DIAS O MESES QUE RECARGAN                                  !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"\nNUMERO_UNIDADES                %d\n",o_val_temporal)== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! LA VALIDEZ PUEDE COMENZAR EN EL MOMENTO DE LA RECARGA(1) O EN LA     !\n")== EOF)
+        ||(fprintf(config,"! PRIMERA UTILIZACION (2).                                             !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     
+	     ||(fprintf(config,"\nCOMIENZO_VALIDEZ                %d\n",1)== EOF) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     
+        ||(fprintf(config,"! NUMERO MAXIMO DE MESES O DIAS QUE SE PUEDEN RECARGAR				     !\n")== EOF)		  
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     	
+	     ||(fprintf(config,"\nMAXIMO_RECARGA                  %d\n",o_max_recarga)== EOF) //fijo		  
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     	
+        ||(fprintf(config,"! DICE SI ESTE CONTRATO SE PUEDE RECARGAR (1) O NO (0)				     !\n")== EOF)		  
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)		  	     	
+	     ||(fprintf(config,"\nRECARGABLE                  %d\n",o_recargable)== EOF)
+	     ||(fprintf(config,"\n%s\n",comentario_met)== EOF))
+	     {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+      }
+	     
+	          
+     
+      
+//printf("\nPaso 5.Titulo %d",o_titulo);
+return(0);
+}
+
+
+
+
+/*************************************************************************************
+  SE ESCRIBEN LOS DISTINTOS PRECIOS PARA UN TITULO
+  se emplea la misma rutina para escribir los precios del titulo fisico y titulo logico
+************************************************************************************/
+int Escribe_detalle_precios(unsigned char escribe_total) 
+{
+
+  if (Declara_cursor_precios_titulos() != 0)
+	{
+	return(1);
+	}
+ 
+
+  if ( ((escribe_total) 
+         &&(fprintf(config,"PRECIOS_POR_TARIFA      %d\n\n",o_total_elementos)== EOF)) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! EN FUNCION DE LOS PRECIOS POR TARIFA INTRODUCIDOS TENDREMOS TANTOS   !\n")== EOF)
+        ||(fprintf(config,"! PRECIOS EN FUNCION DE LA ZONA                                        !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"PRECIOS       ")== EOF)) //fijo
+     {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+      }
+		  
+  while(Leer_cpt() == 0)
+  {
+		 if (fprintf(config,"%d ",o_precio)== EOF)
+       {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+        }
+      
+  }//del while
+  if (fprintf(config,"\n\n")== EOF)
+  {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+   }
+      
+EXEC SQL CLOSE CPT; 
+
+	 	 return(0); 			  		  
+}
+
+     
+/*************************************************************************************
+  SE ESCRIBEN LOS DISTINTOS TITULOS FISICOS ASOCIADOS AL TITULO LOGICO
+  actualmente se pone fijo a 1 y es el propio titulo 
+  los precios no va asociados a la zona
+************************************************************************************/
+int Escribe_titulos_fisicos() 
+{
+     if ((fprintf(config,"! INDICE QUE NOS INDICA CUANTOS TITULOS FISICOS TENDREMOS ASOCIADOS    !\n")== EOF)
+        ||(fprintf(config,"! AL TITULO LOGICO QUE ESTAMOS DEFINIENDO                              !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"NUM_TITULO_FISICO       1\n\n")== EOF) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! TIPO DEL TÍTULO (TARIFA -> TITULO FISICO)                            !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"TIPO_TITULO                     %04d\n\n",o_titulo)== EOF) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"! FORMATO 1:SQUARE / 2:ISO                                             !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"FORMATO         1\n\n")== EOF) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"! SOPORTE DE PAPEL QUE SE ASOCIA AL ROLLO AL REALIZAR LA CARGA DE      !\n")== EOF)
+  	     ||(fprintf(config,"! ROLLOS. 1:NORMAL / 2: ESPECIAL                                       !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"SOPORTE_PAPEL           1\n\n")== EOF) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"! LA VENTA MULTIPLE NOS INDICA LA CANTIDAD MAXIMA DE TITULOS QUE SE    !\n")== EOF)
+  	     ||(fprintf(config,"! PUEDEN VENDER DE UNA SOLA VEZ. SI ES 0/1 COMO MÁXIMO UN TÍTULO.      !\n")== EOF)
+  	     ||(fprintf(config,"! ESTE CAMPO DEBE SER SIEMPRE 1 MIENTRAS EL CAMPO NUM_TITULO_FISICO    !\n")== EOF)
+	     ||(fprintf(config,"! SEA 1. SOLO SE UTILIZA PARA PACKS\n")== EOF)
+ 		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"VENTA_MULTIPLE          9\n\n")== EOF) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"! ESTA MASCARA DEFINE EL DIBUJO QUE EL PROCESADOR IMPRIME EN EL BILLETE\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	     ||(fprintf(config,"MASCARA_IMPRESION         %d\n\n",o_mascara_imp_mavt)== EOF) //fijo
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+       )
+     {
+        sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        escribe_error(mensaje);
+        fclose(config);
+        exit(1);
+      }
+// Se escriben los distintos precios 
+     if (Escribe_detalle_precios(0) != 0)
+         return(1); 
+     return(0);
+
+}
+
+
+/*************************************************************************************
+ GENERA EL FICHERO LOCALIZA.DAT PARA CADA MAVT E 
+ INSERTA EN PTES_ENVIO_CONFIGURACION PARA CADA MAVT LOS CUATRO FICHEROS GENERADOS
+************************************************************************************/
+int Genera_fichero_localiza() 
+{
+ 
+struct stat Estado;
+int resultado; 
+
+
+
+ if (Declara_cursor_localiza() != 0)
+	{
+	return(1);
+	}
+
+  while(Leer_clo() == 0)
+  {
+
+  	 sprintf(directorio_ficheros,"%s%04d/", path_ficheros,o_msavt);
+
+    resultado=stat(directorio_ficheros,&Estado);
+
+//se comprueba si existe el directorio y se crea
+   if (resultado == -1)
+   {
+        sprintf(comando,"mkdir %s",directorio_ficheros);
+        system(comando); 
+        resultado=stat(directorio_ficheros,&Estado);
+    
+       //se comprueba si se ha creado el directorio
+       if (resultado == -1)
+       {
+           sprintf(mensaje,"\nError al crear directorio %s",directorio_ficheros);
+           escribe_error(mensaje);
+           exit(1); 
+	     }
+	 }
+	 sprintf(nombre_fichero,"%s%04d/Localiza.dat", path_ficheros,o_msavt);
+    if(!(config=fopen(nombre_fichero,"w")))
+    {
+       sprintf(mensaje,"\nError creando fichero %s",nombre_fichero);
+       escribe_error(mensaje);
+       return(1);
+    }
+    sprintf(mensaje,"Generando : %s",nombre_fichero);
+    escribe_error(mensaje);
+
+    //(2004-04-13)
+    //En numero maquina meto posicion segun indicaciones Rodolfo
+    if  ((fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! INFORMACION RELATIVA A LA UBICACION FISICA DE LA MAQUINA\n")== EOF)
+        ||(fprintf(config,"ZONA                    %02d\n",o_zona)== EOF)
+        ||(fprintf(config,"LINEA                   %02d\n",o_linea)== EOF)
+        ||(fprintf(config,"NUMERO_MAQUINA          %02d\n",o_posicion)== EOF)
+        ||(fprintf(config,"EMPRESA                 1\n")== EOF) //fijo
+        ||(fprintf(config,"ESTACION                %02d\n",o_estacion)== EOF)
+        ||(fprintf(config,"VESTIBULO               %02d\n",o_atrio)== EOF)
+        ||(fprintf(config,"TIPO_EQUIPO             %02d\n",o_tipo_equipo)== EOF) //fijo
+        ||(fprintf(config,"MODELO                  %s\n",o_modelo.arr)== EOF)//fijo
+        ||(fprintf(config,"NUMERO_SERIE            %02d\n",o_num_serie)== EOF)
+        ||(fprintf(config,"POSICION                %02d\n",o_posicion)== EOF)
+        ||(fprintf(config,"PUNTO_VENTA             %02d\n",o_msavt)== EOF) // no se usa
+        ||(fprintf(config,"DENTRO                  %d\n",o_dentro)== EOF)
+		)
+    {
+      sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+      escribe_error(mensaje);
+      fclose(config);
+      exit(1);
+    }      
+    fclose(config);
+
+  }//del while      
+   
+EXEC SQL CLOSE CLO; 
+
+return(0);
+}
+
+
+/************************************************************************
+ GENERA EL FICHERO DE SINCONTACTO.NEW
+************************************************************************/
+int Genera_fichero_sincontacto() 
+{
+  orden_titulo = 0;  
+  sprintf(nombre_fichero,"%sSinContacto.new", path_ficheros);
+
+  if(!(config=fopen(nombre_fichero,"w")))
+  {
+    sprintf(mensaje,"\nError creando fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    return(1);
+  }
+
+    sprintf(mensaje,"Generando : %s",nombre_fichero);
+    escribe_error(mensaje);
+
+if (Declara_cursor_sincontacto() != 0)
+	{
+	return(1);
+	}
+	
+	
+	printf("pasa los cursores");
+	fflush(stdout);
+	
+	
+if  ((fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! FECHA DE ENTRADA EN VIGOR DE LAS SIGUIENTES TARIFAS                  !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"FECHA_ENT_VIGOR                         %s\n\n",o_fecha_entrada_vigor.arr)== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! LA DIVISA EN QUE SE DEFINEN LAS TARIFAS SE SUPONE QUE ES LA MISMA    !\n! QUE EN TARIFAS.DAT POR LO QUE AQUÍ NO SE PONE						   !\n! AUNQUE EN REALIDAD SÓLO HAY EUROS		\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! NUMERO TOTAL DE TARIFAS QUE SE DETALLAN						              !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"NUMERO_TITULOS  %d\n\n",o_total_elementos)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	 )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  while(Leer_ctts() == 0)
+  {
+     orden_titulo +=1;
+
+     /*printf("leido ctts");
+	fflush(stdout);
+*/	
+     if (Escribe_detalle_titulo_7colinas() != 0)
+         return(1); 
+  
+  }//del while      
+   
+  
+  EXEC SQL CLOSE CTTS; 
+  
+/*  if (Declara_cursor_rollo() != 0)
+	{
+	return(1);
+	}
+  
+  printf("leido sin");
+	fflush(stdout);
+     
+
+while(Leer_ctts_rollo()== 0)
+  {
+    // orden_titulo +=1;
+
+     printf("leido ctts");
+	fflush(stdout);
+	
+     if (Escribe_detalle_titulo_rollo() != 0)
+         return(1); 
+  
+  }//del while      
+  
+   
+EXEC SQL CLOSE CTTS_R;*/
+  
+  if (Declara_cursor_7colinas() != 0)
+	{
+	return(1);
+	}
+  
+  printf("leido sin");
+	fflush(stdout);
+	
+	
+	if((fprintf(config,"%s\n",comentario_met)== EOF)||
+        (fprintf(config,"NUM_TITULOS_7COLINAS	%d\n", o_total_elementos)== EOF)||
+        (fprintf(config,"PRECIO_SOPORTE_7_COLINAS_ROLLO	%s\n\n", (char*)o_soporte_7C.arr)== EOF))
+        {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+     
+
+while(Leer_ctts_7()== 0)
+  {
+     orden_titulo +=1;
+
+     /*printf("leido ctts");
+	fflush(stdout);
+*/	
+     if (Escribe_detalle_titulo_rollo() != 0)
+         return(1); 
+  
+  }//del while      
+  
+   
+EXEC SQL CLOSE CTTS_7;
+      
+   fclose(config);
+
+return(0);
+}
+
+/************************************************************************
+ GENERA EL FICHERO DE CONTACTLESS.NEW
+************************************************************************/
+int Genera_fichero_contactless() 
+{
+  orden_titulo = 0;  
+  sprintf(nombre_fichero,"%scontactless.new", path_ficheros);
+
+  if(!(config=fopen(nombre_fichero,"w")))
+  {
+    sprintf(mensaje,"\nError creando fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    return(1);
+  }
+
+    sprintf(mensaje,"Generando : %s",nombre_fichero);
+    escribe_error(mensaje);
+
+	
+  if (Declara_cursor_7colinas() != 0)
+	{
+	return(1);
+	}
+  
+	
+o_total_elementos = 0;
+
+
+EXEC SQL  SELECT COUNT(*)+1 INTO :o_total_elementos
+	   FROM TITULOS A 	    
+	   WHERE 
+	     A.FEC_INI <= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND 
+	     A.FEC_FIN >= TO_DATE(:o_fecha_referencia,'YYYYMMDD')  AND
+	     MAG_SC = 'S' AND MAVT = 1 AND TITULO != 0;	
+	
+	
+if  ((fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! FECHA DE ENTRADA EN VIGOR DE LAS SIGUIENTES TARIFAS                  !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"FECHA_ENT_VIGOR                         %s\n\n",o_fecha_entrada_vigor.arr)== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! LA DIVISA EN QUE SE DEFINEN LAS TARIFAS SE SUPONE QUE ES LA MISMA    !\n! QUE EN TARIFAS.DAT POR LO QUE AQUÍ NO SE PONE						   !\n! AUNQUE EN REALIDAD SÓLO HAY EUROS		\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"PRECIO_SOPORTE_7_COLINAS_ROLLO	%s\n\n", (char*)o_soporte_7C.arr)== EOF)
+        ||(fprintf(config,"! NUMERO TOTAL DE TARIFAS QUE SE DETALLAN						              !\n")== EOF)
+		  ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"NUMERO_TITULOS  %d\n\n",o_total_elementos)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+	 )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  
+
+while(Leer_ctts_7()== 0)
+  {
+     orden_titulo +=1;
+     if (Escribe_detalle_titulo_7colinas_Contactless() != 0)
+         return(1); 
+  
+  }//del while      
+  
+   
+EXEC SQL CLOSE CTTS_7;
+  
+  
+if (Declara_cursor_sincontacto() != 0)
+	{
+	return(1);
+	}
+	
+  while(Leer_ctts() == 0)
+  {
+     orden_titulo +=1;
+
+     if (Escribe_detalle_titulo_7colinas_Contactless() != 0)
+         return(1); 
+  
+  }//del while      
+   
+  
+  EXEC SQL CLOSE CTTS;   
+      
+   fclose(config);
+
+return(0);
+}
+
+
+/************************************************************************
+ GENERA EL FICHERO DE PARAM_SW.DAT
+ MISMO FICHERO PARA TODAS LAS MAVT CON INF GENERICA (DIVISA,HORA_CIERRE,PUERTO_CON)
+************************************************************************/
+int Genera_fichero_param_sw() 
+{
+  orden_titulo = 0;  
+  sprintf(nombre_fichero,"%sParam_sw.dat", path_ficheros);
+
+  if(!(config=fopen(nombre_fichero,"w")))
+  {
+    sprintf(mensaje,"\nError creando fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    return(1);
+  }
+
+    sprintf(mensaje,"Generando : %s",nombre_fichero);
+    escribe_error(mensaje);
+
+if (Obtiene_param_sw() != 0)
+	{
+		return(1);
+	}
+
+
+
+if  (   (fprintf(config,"INFORMACION_DISCO %s\n",inf_disco)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! Divisa de cambio, para hoppers y aceptadores:!\n")== EOF)
+	     ||(fprintf(config,"! 1 euro (centimos)                            !\n")== EOF)
+	     ||(fprintf(config,"!                                              !\n")== EOF)
+	     ||(fprintf(config,"! 2 escudos                                    !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"DIVISA_CAMBIO %s\n",div_cambio)== EOF)	     
+		  ||(fprintf(config,"NUMERO_HOPPERS %s\n",num_hoppers)== EOF)	     
+		  ||(fprintf(config,"NUMERO_RECARGADORES %s\n",num_recar_1)== EOF)	     
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! HOPPERS:VALOR/NIVEL_MINIMO/NIVEL_MAXIMO/RECARGA/RECICLADO	!\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"INFORMACION_HOPPER_1 %s\n",inf_hopper_1)== EOF)	     
+		  ||(fprintf(config,"INFORMACION_HOPPER_2 %s\n",inf_hopper_2)== EOF)	     
+		  ||(fprintf(config,"INFORMACION_HOPPER_3 %s\n",inf_hopper_3)== EOF)	     
+		  ||(fprintf(config,"INFORMACION_HOPPER_4 %s\n",inf_hopper_4)== EOF)	     		  
+		  ||(fprintf(config,"NUMERO_CAJAS_RECAUDACION %s\n",num_caj_rec)== EOF)	     		  
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! CAJA: NIVEL_MAXIMO/NIVEL_AVISO                   !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"INFORMACION_CAJA %s\n",inf_caja)== EOF)	     		  
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! BILLETERO: NIVEL_MAXIMO/NIVEL_AVISO              !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"INFORMACION_BILLETERO %s\n",inf_billetero)== EOF)	     		  
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!Divisa de aceptacion,monedas y billetes aceptados:!\n")== EOF)
+	     ||(fprintf(config,"! 1 euro (centimos)                                !\n")== EOF)
+	     ||(fprintf(config,"!                                                  !\n")== EOF)
+	     ||(fprintf(config,"! 2 escudos                                        !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"DIVISA_ACEPTACION %s\n",div_aceptacion)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!Configuracion de monedas 10 elementos de:         !\n")== EOF)
+	     ||(fprintf(config,"!	valor: valor numerico de la moneda.             !\n")== EOF)
+	     ||(fprintf(config,"!	Aceptacion: 1 aceptada	2 no aceptada           !\n")== EOF)
+	     ||(fprintf(config,"!	Peso: peso en gramos de la moneda               !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"MONEDA %s\n",mon_1)== EOF)
+		  ||(fprintf(config,"MONEDA %s\n",mon_2)== EOF)
+		  ||(fprintf(config,"MONEDA %s\n",mon_3)== EOF)
+		  ||(fprintf(config,"MONEDA %s\n",mon_4)== EOF)
+		  ||(fprintf(config,"MONEDA %s\n",mon_5)== EOF)
+		  ||(fprintf(config,"MONEDA %s\n",mon_6)== EOF)
+		  ||(fprintf(config,"MONEDA %s\n",mon_7)== EOF)
+		  ||(fprintf(config,"MONEDA %s\n",mon_8)== EOF)
+		  ||(fprintf(config,"MONEDA %s\n",mon_9)== EOF)
+		  ||(fprintf(config,"MONEDA %s\n",mon_10)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!Configuracion de billetes 10 elementos de:        !\n")== EOF)
+	     ||(fprintf(config,"!	valor: valor numerico del billete.              !\n")== EOF)
+	     ||(fprintf(config,"!	Aceptacion: 1 aceptado	2 no aceptado           !\n")== EOF)
+	     ||(fprintf(config,"!	Importe compra:indica cual es el importe minimo !\n")== EOF)
+	     ||(fprintf(config,"!	para poder pagar con ese billete                !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"BILLETE %s\n",bil_1)== EOF)
+		  ||(fprintf(config,"BILLETE %s\n",bil_2)== EOF)
+		  ||(fprintf(config,"BILLETE %s\n",bil_3)== EOF)
+		  ||(fprintf(config,"BILLETE %s\n",bil_4)== EOF)
+		  ||(fprintf(config,"BILLETE %s\n",bil_5)== EOF)
+		  ||(fprintf(config,"BILLETE %s\n",bil_6)== EOF)
+		  ||(fprintf(config,"BILLETE %s\n",bil_7)== EOF)
+		  ||(fprintf(config,"BILLETE %s\n",bil_8)== EOF)
+		  ||(fprintf(config,"BILLETE %s\n",bil_9)== EOF)
+		  ||(fprintf(config,"BILLETE %s\n",bil_10)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!INFORMACION ROLLOS:NUMERO_ROLLOS/NUMERO_BILLETES_POR_ROLLO !\n")== EOF)
+	     ||(fprintf(config,"!Y NIVEL DE AVISO (NUMERO DE BILLETES EXPENDIDOS)PARA ALARMA!\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"INFORMACION_ROLLOS %s\n",inf_rollos)== EOF)
+		  ||(fprintf(config,"SOPORTE_TICKET_CONTABLE %s\n",sop_tick_conta)== EOF)
+		  ||(fprintf(config,"TEMPORIZADORES %s\n",temporizadores)== EOF)
+		  ||(fprintf(config,"HORA_ENCENDIDO %s\n",hora_encendido)== EOF)
+		  ||(fprintf(config,"HORA_APAGADO %s\n",hora_apagado)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!HORA DE CIERRE DE LA JORNADA CONTABLE                      !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"HORA_CIERRE %s\n",hora_cierre)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!MEDIOS DE PAGO:MONEDAS/BILLETES/CREDITO/CHIP               !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"MEDIOS_DE_PAGO %s\n",medios_pago)== EOF)
+		  ||(fprintf(config,"IDIOMA_POR_DEFECTO %s\n",idioma_por_def)== EOF)
+		  ||(fprintf(config,"APAGADO_UPS %s\n",apagado_ups)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!Los dos siguientes parametros van a indicar las fechas entre!\n")== EOF)
+        ||(fprintf(config,"!las que puede funcionar esta configuracion.Esto viene       !\n")== EOF)        
+		  ||(fprintf(config,"!motivado por el periodo de convivencia entre las monedas    !\n")== EOF)
+        ||(fprintf(config,"!local y el euro                                             !\n")== EOF)		  
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"! Fecha de inicio de funcionamiento. Todo a 0 desde siempre\n")== EOF)
+        ||(fprintf(config,"! Lo pongo al 2001 porque si no no curro\n")== EOF)		  
+		  ||(fprintf(config,"FECHA_ACTIVACION %s\n",fec_activacion)== EOF)
+		  ||(fprintf(config,"! Fecha de fin de funcionamiento. Todo a 0 hasta el dia del juicio\n")== EOF)
+		  ||(fprintf(config,"FECHA_DESACTIVACION %s\n",fec_desactiv)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!Los dos siguientes parametros son la direccion y el puerto  !\n")== EOF)
+        ||(fprintf(config,"!del puesto central de datos por el que empezamos la         !\n")== EOF)        
+		  ||(fprintf(config,"!comunicacion, tambien llamado puerto comodin                !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"DIR_COMODIN %s\n",dir_comodin)== EOF)
+		  ||(fprintf(config,"PUERTO_COMODIN %s\n",puerto_comodin)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! Puerto por el que hablamos con el concentrador             !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"PUERTO_CONCENTRADOR %s\n",puerto_concen)== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"!Esto nos dice si permitimos la identificacion mediante tarjeta!\n")== EOF)
+        ||(fprintf(config,"!magnetica (1) o no (0)                                        !\n")== EOF)	
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+		  ||(fprintf(config,"USAR_ID_MAGNETICA %s\n",usar_id_mag)== EOF)
+	||(fprintf(config,"%s\n",comentario_met)== EOF)
+	||(fprintf(config,"!Este campo nos dice en un rollo de tarjetas ctless, cuantos    !\n")== EOF)
+	||(fprintf(config,"!titulos permitimos sacar despues de ver FinRollo               !\n")== EOF)
+	||(fprintf(config,"%s\n",comentario_met)== EOF)
+	||(fprintf(config,"OFFSET_FIN_ROLLO	 %s\n\n", offset_fin_rollo)== EOF)
+	||(fprintf(config,"%s\n",comentario_met)== EOF)
+	||(fprintf(config,"!Este campo nos dice el numero de dias que dejamos que siga     !\n")== EOF)
+	||(fprintf(config,"!vigente el soporte, una vez que ha caducado                    !\n")== EOF)
+	||(fprintf(config,"%s\n",comentario_met)== EOF)
+	||(fprintf(config,"DIAS_VALIDEZ_SOPORTE_CTLESS  %s\n", dias_val_sopo_ctless)== EOF)
+	||(fprintf(config,"DIAS_VALIDEZ_SOPORTE_7C  %s\n", dias_val_sopo_7C)== EOF)
+	||(fprintf(config,"%s\n",comentario_met)== EOF)
+	||(fprintf(config,"!Este campo nos dice si la MAVT tiene instalado el lector de     !\n")== EOF)
+	||(fprintf(config,"!cajas de recarga: 0 -> NO, 1 -> SI                    !\n")== EOF)
+	||(fprintf(config,"%s\n",comentario_met)== EOF)
+	||(fprintf(config,"CAJAS_RFID	0\n")== EOF)
+	
+	 )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+      
+   fclose(config);
+
+return(0);
+}
+
+/************************************************************************
+ GENERA EL FICHERO DE UnidViaje.NEW
+************************************************************************/
+int Genera_fichero_unidades_viaje() 
+{
+  num_tramo = 0;  
+  sprintf(nombre_fichero,"%sUnidViaje.new", path_ficheros);
+
+  if(!(config=fopen(nombre_fichero,"w")))
+  {
+    sprintf(mensaje,"\nError creando fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    return(1);
+  }
+
+    sprintf(mensaje,"Generando : %s",nombre_fichero);
+    escribe_error(mensaje);
+
+if (Declara_cursor_unidades_viaje() != 0)
+	{
+	return(1);
+	}
+	
+if (Declara_cursor_ventas_unidades_viaje() != 0)
+	{
+	return(1);
+	}
+	
+	
+	printf("pasa los cursores");
+	fflush(stdout);
+	
+if ( !Capturar_parametros("UNID_VIAJ_1ZONA",(char*)o_zona1.arr) ||
+   	!Capturar_parametros("UNID_VIAJ_2ZONA",(char*)o_zona2.arr) ||
+   	!Capturar_parametros("UNID_VIAJE_MAX_VENTA",(char*)o_unid_viaje_max_venta.arr) ||
+        !Capturar_parametros("UNID_VIAJE_MAX_RECAR",(char*)o_unid_viaje_max_recar.arr))
+     	{
+        exit(1);
+     	}
+	
+	
+if  ((fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! FECHA DE ENTRADA EN VIGOR                   !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"FECHA_ENT_VIGOR                         %s\n\n",o_fecha_entrada_vigor.arr)== EOF)
+        ||(fprintf(config,"PRECIO_UNID                         5\n\n")== EOF)
+	 )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  
+  while(Leer_cuv() == 0)
+  {
+   num_tramo +=1;
+
+     if  ((fprintf(config,"TRAMO_%d	%d	%d\n\n",num_tramo, o_cuantia, o_unid_credito)== EOF)
+   	 )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  
+  }//del while      
+   
+ 
+  EXEC SQL CLOSE CUV; 
+  
+if  ((fprintf(config,"1_ZONA                         %s\n\n",o_zona1.arr)== EOF)
+     || (fprintf(config,"2_ZONAS                         %s\n\n",o_zona2.arr)== EOF)
+     || (fprintf(config,"NUM_MAX_RECARGA                         %s\n\n",o_unid_viaje_max_recar.arr)== EOF)
+     || (fprintf(config,"NUM_MAX_VENTA                         %s\n\n",o_unid_viaje_max_venta.arr)== EOF)
+     ||(fprintf(config,"IMPORTES_VENTA\t")== EOF)
+	 )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  
+   while(Leer_cvuv() == 0)
+  {
+ 
+     if  ((fprintf(config,"%d\t", o_ventas_unid_credito)== EOF)
+   	 )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  
+  }//del while  
+  
+  EXEC SQL CLOSE CVUV; 
+  
+  if  ((fprintf(config,"\n")== EOF)
+     || (fprintf(config,"TEXTO	viagem#1#zona	viagens#1#zona	c/#saldo		viagem#2#zonas	viagens#2#zonas		ou	Ultima#validação\n")== EOF)
+     || (fprintf(config,"TEXTO	viaje#1#zona	viajes#1#zona	c/#saldo		viaje#2#zonas	viajes#2#zonas		o	Última#validación\n")== EOF)
+     || (fprintf(config,"TEXTO	one-zone#journey	one-zone#journey	/#credit		two-zone#journey	two-zone#journey		or	Last#validation\n")== EOF)
+     || (fprintf(config,"TEXTO	voyage#une#zone	voyages#une#zone	/#solde		voyage#deux#zones	voyages#deux#zones		ou	Dernière#validation")== EOF)
+      )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }   
+      
+   fclose(config);
+
+return(0);
+}
+
+/************************************************************************
+ GENERA EL FICHERO DE UnidViaje.NEW
+************************************************************************/
+int Genera_fichero_unidades_transporte_centimo() 
+{
+  num_tramo = 0;  
+  sprintf(nombre_fichero,"%sUnidTransporte1C.new", path_ficheros);
+
+  if(!(config=fopen(nombre_fichero,"w")))
+  {
+    sprintf(mensaje,"\nError creando fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    return(1);
+  }
+
+    sprintf(mensaje,"Generando : %s",nombre_fichero);
+    escribe_error(mensaje);
+
+if (Declara_cursor_unidades_viaje_centimo() != 0)
+	{
+	return(1);
+	}
+	
+if (Declara_cursor_ventas_unidades_viaje_centimo() != 0)
+	{
+	return(1);
+	}
+	
+	
+	printf("pasa los cursores");
+	fflush(stdout);
+	
+if ( !Capturar_parametros("UNID_VIAJ_1ZONA_CENT",(char*)o_zona1_centimo.arr) ||
+
+   	!Capturar_parametros("UNID_VIAJ_2ZONA_CENT",(char*)o_zona2_centimo.arr)||
+   	!Capturar_parametros("UNID_T_MAX_VEN_CENT",(char*)o_unid_viaje_max_venta_centimo.arr) ||
+        !Capturar_parametros("UNID_T_MAX_REC_CENT",(char*)o_unid_viaje_max_recar_centimo.arr))
+     	{
+        exit(1);
+     	}
+	
+	
+if  ((fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"! FECHA DE ENTRADA EN VIGOR                   !\n")== EOF)
+        ||(fprintf(config,"%s\n",comentario_met)== EOF)
+        ||(fprintf(config,"FECHA_ENT_VIGOR                         %s\n\n",o_fecha_entrada_vigor.arr)== EOF)
+        ||(fprintf(config,"PRECIO_UNID                         1\n\n")== EOF)
+	 )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  
+  while(Leer_cuvc() == 0)
+  {
+   num_tramo +=1;
+
+     if  ((fprintf(config,"TRAMO_%d	%d	%d\n\n",num_tramo, o_cuantia_centimo, o_unid_credito_centimo)== EOF)
+   	 )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  
+  }//del while      
+   
+ 
+  EXEC SQL CLOSE CUVC; 
+  
+if  ((fprintf(config,"1_ZONA                         %s\n\n",o_zona1_centimo.arr)== EOF)
+     || (fprintf(config,"2_ZONAS                         %s\n\n",o_zona2_centimo.arr)== EOF)
+     || (fprintf(config,"NUM_MAX_RECARGA                         %s\n\n",o_unid_viaje_max_recar_centimo.arr)== EOF)
+     || (fprintf(config,"NUM_MAX_VENTA                         %s\n\n",o_unid_viaje_max_venta_centimo.arr)== EOF)
+     ||(fprintf(config,"IMPORTES_VENTA\t")== EOF)
+	 )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  
+   while(Leer_cvuvc() == 0)
+  {
+ 
+     if  ((fprintf(config,"%d\t", o_ventas_unid_credito_centimo)== EOF)
+   	 )
+  {
+    sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+    escribe_error(mensaje);
+    fclose(config);
+    exit(1);
+  }
+  
+  }//del while  
+  
+  EXEC SQL CLOSE CVUVC; 
+        
+   fclose(config);
+
+return(0);
+}
+
+/************************************************************************
+INSERTA EN FICHEROS PENDIENTES DE ENVIAR LOS TRES TIPOS DE FICHEROS QUE 
+SE GENERAN  ELIMINANDO LOS PENDIENTES DE ENVIO  
+************************************************************************/
+int Inserta_pte_envio_configuracion(char *directorio_origen, const char *fichero)
+{
+
+sprintf((char*)o_comando_oracle.arr,
+        "DELETE FROM ENVIO_FICHEROS_CONFIG WHERE FICHERO ='%s' AND IP = '%s' "
+        "AND ESTADO = 'G' AND TIPO_EQUIPO='A'",fichero,(char *)o_ip.arr);
+            
+o_comando_oracle.len=strlen((char*)o_comando_oracle.arr);
+
+EXEC SQL  WHENEVER SQLERROR DO trata_error_oracle("ELIMINANDO FICHERO"); 
+oraca.orastxtf = ORASTFERR;
+EXEC SQL EXECUTE IMMEDIATE :o_comando_oracle; 
+
+sprintf((char*)o_comando_oracle.arr,
+        "INSERT INTO ENVIO_FICHEROS_CONFIG (FECHA_REFERENCIA,FICHERO,DIR_ORIGEN,"
+	     "DIR_DESTINO,IP,TIPO_EQUIPO,FECHA_GENERADO,EQUIPO) VALUES (TO_DATE('%s','YYYYMMDD'),"
+	     "'%s','%s','%s','%s','A',sysdate,%d)",(char *)o_fecha_referencia.arr,fichero,directorio_origen,
+	     (char *)o_directorio_destino.arr,(char *)o_ip.arr,o_msavt); 
+
+            
+o_comando_oracle.len=strlen((char*)o_comando_oracle.arr);
+
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("INSERTANDO FICHERO"); 
+oraca.orastxtf = ORASTFERR;
+EXEC SQL EXECUTE IMMEDIATE :o_comando_oracle; 
+
+   
+   return(sqlca.sqlcode);
+}
+
+
+/************************************************************************
+PREPARA ENVIO DE FICHEROS.INSERTA LAS TRANSFERENCIAS PARA EL POSTERIOR
+ENVIO DE FICHEROS.SE RECORRE TODAS LAS MAVT. REQUIERE PARAMETRO localiza
+1 Se han hecho los ficheros de localizacion
+0 Solo se han hecho los ficheros genericos
+************************************************************************/
+int prepara_envio(int localiza)
+{
+
+ if (Declara_cursor_localiza() != 0)
+	{
+	return(1);
+	}
+
+  while(Leer_clo() == 0)
+  {
+  	 sprintf(directorio_ficheros,"%s%04d/", path_ficheros,o_msavt);
+	 
+	 if (localiza)
+	 {
+    if (
+		(Inserta_pte_envio_configuracion(directorio_ficheros,"Localiza.dat") != 0) ||
+		(Inserta_pte_envio_configuracion(path_ficheros,"Lineas.dat") != 0) 
+		||(Inserta_pte_envio_configuracion(path_ficheros,"Param_sw.dat") != 0)	
+    ||(Inserta_pte_envio_configuracion(path_ficheros,"Tarifas.new") != 0) 
+		||(Inserta_pte_envio_configuracion(path_ficheros,"SinContacto.new") != 0)
+		||(Inserta_pte_envio_configuracion(path_ficheros,"UnidViaje.new") != 0)
+		||(Inserta_pte_envio_configuracion(path_ficheros,"UnidTransporte1C.new") != 0)
+		||(Inserta_pte_envio_configuracion(path_ficheros,"contactless.new") != 0)
+		 )
+         return(1);
+	 }
+	 else
+	 {
+//	 if (
+//		(Inserta_pte_envio_configuracion(path_ficheros,"Lineas.dat") != 0) 
+//		||(Inserta_pte_envio_configuracion(path_ficheros,"Param_sw.dat") != 0)	
+//    ||(Inserta_pte_envio_configuracion(path_ficheros,"Tarifas.new") != 0) 
+//		||(Inserta_pte_envio_configuracion(path_ficheros,"SinContacto.new") != 0)
+//		 )
+//		 	return(1);
+	 }
+
+    }
+	EXEC SQL CLOSE CLO; 
+   
+   return(0);
+}
+
+/*************************************************************************
+/ LECTURA CURSOR CE
+**************************************************************************/
+int Leer_ce()
+{
+ EXEC SQL
+  FETCH CE INTO :o_estacion, :o_nombre, :o_linea;
+  
+  o_nombre.arr[o_nombre.len]='\0';
+  return(sqlca.sqlcode);
+}
+/*************************************************************************
+/ LECTURA CURSOR CL
+**************************************************************************/
+int Leer_cl()
+{
+ EXEC SQL
+  FETCH CL INTO :o_linea, :o_nombre;
+  
+  o_nombre.arr[o_nombre.len]='\0';
+  
+  return(sqlca.sqlcode);
+}
+/*************************************************************************
+/ LECTURA CURSOR CT
+**************************************************************************/
+int Leer_ct()
+{
+/*
+ EXEC SQL
+  FETCH CT INTO :o_....;
+  */
+  return(sqlca.sqlcode);
+}
+
+/*************************************************************************
+/ LECTURA CURSOR CTT
+**************************************************************************/
+int Leer_ctt()
+{
+ EXEC SQL
+  FETCH CTT INTO :o_titulo, :o_nombre, :o_abreviado, :o_mascara_imp_mavt;
+  o_nombre.arr[o_nombre.len]='\0';
+  o_abreviado.arr[o_abreviado.len]='\0';
+  
+  return(sqlca.sqlcode);
+}
+
+
+/*************************************************************************
+/ LECTURA CURSOR CLO
+**************************************************************************/
+int Leer_clo()
+{
+ EXEC SQL
+  FETCH CLO INTO :o_msavt, :o_estacion, :o_atrio, :o_posicion, :o_num_serie, 
+                 :o_linea, :o_zona, :o_tipo_equipo, :o_modelo, :o_ip, :o_dentro;
+  o_modelo.arr[o_modelo.len]='\0';
+  o_ip.arr[o_ip.len]='\0';
+
+  return(sqlca.sqlcode);
+}
+/*************************************************************************
+/ LECTURA CURSOR CPT
+**************************************************************************/
+int Leer_cpt()
+{
+ EXEC SQL
+  FETCH CPT INTO :o_precio;
+  
+  return(sqlca.sqlcode);
+}
+
+/*************************************************************************
+/ LECTURA CURSOR CTTS
+**************************************************************************/
+int Leer_ctts()
+{
+ EXEC SQL
+  FETCH CTTS INTO :o_titulo, :o_nombre, :o_abreviado, :o_tip_val_temp,
+  :o_val_temporal, :o_max_recarga, :o_perfil_contrato, o_descartable,:o_recargable, 
+  :o_tipo_contrato_7C, :o_tick_oper_code, :o_venta;
+  o_nombre.arr[o_nombre.len]='\0';
+  o_abreviado.arr[o_abreviado.len]='\0';
+  if (o_descartable == 1 || o_titulo == 824)
+  {
+	 o_titulo_sc = o_titulo | 0X8000;	
+  }
+  else
+  {
+  	o_titulo_sc = o_titulo;
+  }
+  
+  return(sqlca.sqlcode);
+}
+
+/***************************************************************************/
+
+int Leer_ctts_7()
+{
+ EXEC SQL
+  FETCH CTTS_7 INTO :o_titulo, :o_nombre, :o_abreviado, :o_tip_val_temp,
+  :o_val_temporal, :o_max_recarga, :o_perfil_contrato, o_descartable,:o_recargable
+  ,:o_tipo_contrato_7C, :o_tick_oper_code, :o_venta;
+  o_nombre.arr[o_nombre.len]='\0';
+  o_abreviado.arr[o_abreviado.len]='\0';
+  //(2004/01/23)Cambio el cod del titulo en caso de bit_tick_code=1
+   
+  if (o_descartable == 1 || o_titulo == 824)
+  {
+	 o_titulo_sc = o_titulo | 0X8000;	
+  }
+  
+  return(sqlca.sqlcode);
+}
+
+/***************************************************************************/
+
+int Leer_ctts_rollo()
+{
+ EXEC SQL
+  FETCH CTTS_R INTO :o_titulo, :o_titulo_rollo, :o_nombre, :o_abreviado, :o_tip_val_temp,
+  :o_val_temporal, :o_max_recarga, :o_perfil_contrato, o_descartable,:o_recargable;
+  o_nombre.arr[o_nombre.len]='\0';
+  o_abreviado.arr[o_abreviado.len]='\0';
+   
+  return(sqlca.sqlcode);
+}
+/*************************************************************************
+/ LECTURA CURSOR CUV
+**************************************************************************/
+int Leer_cuv()
+{
+ EXEC SQL
+  FETCH CUV INTO :o_cuantia, :o_unid_credito;
+  
+  return(sqlca.sqlcode);
+}
+/*************************************************************************
+/ LECTURA CURSOR CVUV
+**************************************************************************/
+int Leer_cvuv()
+{
+ EXEC SQL
+  FETCH CVUV INTO :o_ventas_unid_credito;
+  
+  return(sqlca.sqlcode);
+}
+
+/*************************************************************************
+/ LECTURA CURSOR CUVC
+**************************************************************************/
+int Leer_cuvc()
+{
+ EXEC SQL
+  FETCH CUVC INTO :o_cuantia_centimo, :o_unid_credito_centimo;
+  
+  return(sqlca.sqlcode);
+}
+/*************************************************************************
+/ LECTURA CURSOR CVUVC
+**************************************************************************/
+int Leer_cvuvc()
+{
+ EXEC SQL
+  FETCH CVUVC INTO :o_ventas_unid_credito_centimo;
+  
+  return(sqlca.sqlcode);
+}
+
+
+
+/*************************************************************************
+/ LECTURA CURSOR CLAY
+**************************************************************************/
+int Leer_clay()
+{
+ EXEC SQL
+  FETCH CLAY INTO :o_desc_1, :o_desc_2, :o_desc_3, :o_desc_4;
+	o_desc_1.arr[o_desc_1.len]='\0';
+	o_desc_2.arr[o_desc_2.len]='\0';
+	o_desc_3.arr[o_desc_3.len]='\0';
+	o_desc_4.arr[o_desc_4.len]='\0';
+  
+  return(sqlca.sqlcode);
+}
+
+/*************************************************************************
+/ LECTURA CURSOR CLAY SC
+**************************************************************************/
+int Leer_clay_sc()
+{
+
+ int i = 0;
+ 
+  EXEC SQL
+  FETCH CLAY_SC INTO :o_desc_1, :o_desc_2, :o_desc_3, :o_desc_4;
+	o_desc_1.arr[o_desc_1.len]='\0';
+	o_desc_2.arr[o_desc_2.len]='\0';
+	o_desc_3.arr[o_desc_3.len]='\0';
+	o_desc_4.arr[o_desc_4.len]='\0';
+	
+ if (sqlca.sqlcode == 1403)
+{
+	
+ EXEC SQL  
+ 	select NVL(TRANSLATE(TRANSLATE(TRANSLATE(descripcion,' ','#'), '_', '-'), '@', ' '),'XXXX')
+ 	into :o_desc_1
+ 	from titulos where titulo = :o_titulo and titulo not in (select titulo from layouts_titulos);
+ 	
+ 	o_desc_1.arr[o_desc_1.len]='\0';
+ 	
+ 	if(sqlca.sqlcode == 0)
+ 	{
+ 	if ((fprintf(config,"\nTEXTO %s # %d,%02d # #",(char*)o_desc_1.arr,(o_precio_layout/100),(o_precio_layout%100))== EOF)||
+	         (fprintf(config,"\nTEXTO %s # %d,%02d # #",(char*)o_desc_1.arr,(o_precio_layout/100),(o_precio_layout%100))== EOF)||
+	         (fprintf(config,"\nTEXTO %s # %d,%02d # #",(char*)o_desc_1.arr,(o_precio_layout/100),(o_precio_layout%100))== EOF)||
+	         (fprintf(config,"\nTEXTO %s # %d,%02d # #",(char*)o_desc_1.arr,(o_precio_layout/100),(o_precio_layout%100))== EOF))
+       		{
+        		sprintf(mensaje,"\nError escribiendo fichero %s",nombre_fichero);
+        		escribe_error(mensaje);
+        		fclose(config);
+        		return(4);
+        	}
+        	return(4);
+        }
+        return(4);
+}
+
+return(sqlca.sqlcode);
+
+}
+
+/*****************************************************************************/
+
+int Leer_clay_rollo()
+{
+ EXEC SQL
+  FETCH CLAY_ROLLO INTO :o_desc_1, :o_desc_2, :o_desc_3, :o_desc_4;
+	o_desc_1.arr[o_desc_1.len]='\0';
+	o_desc_2.arr[o_desc_2.len]='\0';
+	o_desc_3.arr[o_desc_3.len]='\0';
+	o_desc_4.arr[o_desc_4.len]='\0';
+	
+  
+  return(sqlca.sqlcode);
+}
+
+
+/******************************************************************************
+
+FUNCIONES DE LOG Y UTILIDADES ORACLE
+
+******************************************************************************/
+
+int crea_fichero_log()
+{
+int       juliano;
+struct tm *ts;
+long      now;
+
+	time(&now);
+        ts=localtime(&now);
+        if (ts->tm_yday==0)
+        {
+
+          if ((ts->tm_year %4) ==0)
+             juliano = 366;
+          else
+             juliano = 365;
+        }
+        else
+        {
+          juliano = ts->tm_yday+1;
+        }
+ 
+ 
+      sprintf(nombre_fichero_log,"%s/seguimiento_conf_mavt.%03d",
+              directorio_log,juliano);
+
+      fichero_log = fopen(nombre_fichero_log,"a+");
+
+      if (!(fichero_log))
+      {
+         sprintf(mensaje," IMPOSIBLE ABRIR FICHERO %s",directorio_log);
+         escribe_error(mensaje);
+         return(1);
+      }
+
+      fclose(fichero_log);
+      return(0);
+
+}
+ 
+ 
+void escribe_error(const char* msg_error)
+{
+ struct tm *ts;
+ long      now;
+ char      hora[10];
+{
+      fichero_log = fopen(nombre_fichero_log,"a+"); 
+    
+      time(&now);
+      ts=localtime(&now);
+
+      strcpy((char*)o_motivo_error.arr,msg_error);
+
+
+      sprintf(hora,"%02d:%02d:%02d",ts->tm_hour,ts->tm_min,ts->tm_sec);
+ 
+      fprintf(fichero_log,"\n%s -->%s",hora,msg_error);
+
+      fclose(fichero_log);
+} 
+}
+
+void trata_error_oracle(const char *msg)
+{
+    char err_msg[6];
+    unsigned buf_len, msg_len;
+
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    sprintf(mensaje,"%s", msg);
+    escribe_error(mensaje);
+    buf_len = sizeof (err_msg);
+//    sqlglm(err_msg, &buf_len, &msg_len);
+    sprintf(mensaje,"error : %d",sqlca.sqlcode);
+    escribe_error(mensaje);
+    sprintf(mensaje,"%.*s",
+        sqlca.sqlerrm.sqlerrml, sqlca.sqlerrm.sqlerrmc);
+    escribe_error(mensaje);
+    sprintf(mensaje,"in \"%.*s...\"\n",
+        oraca.orastxt.orastxtl, oraca.orastxt.orastxtc);
+    escribe_error(mensaje);
+
+    sprintf(mensaje,"on line %d of %.*s.",
+        oraca.oraslnr, oraca.orasfnm.orasfnml,
+        oraca.orasfnm.orasfnmc);
+    escribe_error(mensaje);
+ 
+}
+
+
+/************************************************************
+ CONEXION CON LA BASE DE DATOS OBTENIENDO USR Y PASSW 
+ DEL FICHERO CLAVE
+************************************************************/
+int Conecta_oracle()
+{
+
+char user[20]; 
+char pass[20];
+char comentario[70];
+char *directorio;
+FILE *fichero_clave;
+
+{
+
+
+   if ((directorio=getenv("FICHERO_CLAVE")) == NULL)
+   {
+      escribe_error(" FALTA VARIABLE ENTORNO FICHERO_CLAVE con el directorio del fichero clave");
+      exit(-1);
+   }
+   strcat(directorio,"/fichero_clave.dat");
+   fichero_clave = fopen(directorio,"r"); 
+
+   if (!(fichero_clave))
+     {
+     sprintf(mensaje," No puedo abrir fichero %s",directorio);
+     escribe_error(mensaje);
+     fflush(stdout);
+     exit(2);
+     }
+
+  fgets(comentario, 78, fichero_clave);
+  fscanf(fichero_clave, "%s\n", &user);
+  fscanf(fichero_clave, "%s\n", &pass);
+
+  fclose(fichero_clave);
+
+  strncpy((char*)username.arr,user,UNAME_LEN);
+  username.len=strlen((char*)username.arr);
+
+  strncpy((char*)password.arr,pass,PWD_LEN);
+  password.len=strlen((char*)password.arr);
+
+
+   sprintf(mensaje,"Conexion con %s/%s",(char*)username.arr,(char*)password.arr);  
+   escribe_error(mensaje);
+
+   EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("ERROR CONEXION"); 
+   oraca.orastxtf = ORASTFERR;
+
+   EXEC SQL CONNECT :username IDENTIFIED BY :password;  
+ 
+   return(sqlca.sqlcode);
+}
+}
+/********************************************************
+ CAPTURA DE LOS PARAMETROS
+********************************************************/
+int Capturar_parametros(const char *nombre, char *valor)
+{
+
+strcpy((char*)nom_param.arr, nombre);
+nom_param.len=strlen((char*)nom_param.arr);
+
+EXEC SQL WHENEVER SQLERROR DO trata_error_oracle("Error en :");
+oraca.orastxtf = ORASTFERR;
+
+EXEC SQL
+     SELECT VALOR INTO :val_param
+     FROM PARAMETROS_EJECUCION
+     WHERE NOMBRE = :nom_param;
+if (sqlca.sqlcode != 0)
+{
+   sprintf(mensaje,"Error  : Parametro %s no definido en base de datos\n",(char*)nom_param.arr);
+   escribe_error(mensaje);
+   return(0);
+}
+
+else
+{
+
+    val_param.arr[val_param.len]='\0';
+    strcpy(valor,(char*)val_param.arr);
+
+    sprintf(mensaje,"Parametro %s --> %s",nombre,valor);
+    escribe_error(mensaje);
+    return(1);
+}
+
+}
+
+/********************************************************
+ REALIZA COMMIT
+********************************************************/
+
+void Realiza_commit()
+{
+        EXEC SQL COMMIT;
+}
+
+/********************************************************
+ REALIZA ROLLBACK
+********************************************************/
+
+void Realiza_rollback()
+{
+        escribe_error("*** ELIMINADO DATOS CARGADOS DEL FICHERO ***");
+        EXEC SQL ROLLBACK;
+}
+
+  
